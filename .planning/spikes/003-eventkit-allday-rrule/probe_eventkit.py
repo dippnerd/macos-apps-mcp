@@ -159,6 +159,11 @@ def from_ek(r) -> dict:
 
 
 SOURCE = os.environ.get("SPIKE_SOURCE", "iCloud")  # SPIKE_SOURCE=Google to compare
+# A source that refuses new calendars (Google, EKErrorDomain 17) needs an EXISTING
+# calendar: SPIKE_CALENDAR=<title>. That calendar is never removed — only the events
+# titled PREFIX… are, by id and then by a sweep.
+EXISTING = os.environ.get("SPIKE_CALENDAR")
+PREFIX = f"{CAL_TITLE} "
 
 
 def scratch_calendar(s) -> object:
@@ -181,6 +186,43 @@ def remove_scratch(s) -> None:
         if c.title() == CAL_TITLE:
             ok, err = s.removeCalendar_commit_error_(c, True, None)
             print(f"removed scratch calendar: {ok} {err or ''}")
+
+
+def existing_calendar(s) -> object:
+    cals = [
+        c
+        for x in s.sources()
+        if x.title() == SOURCE
+        for c in x.calendarsForEntityType_(EK.EKEntityTypeEvent)
+        if c.title() == EXISTING and c.allowsContentModifications()
+    ]
+    if len(cals) != 1:
+        raise SystemExit(
+            f"expected one writable {SOURCE}/{EXISTING}, found {len(cals)}"
+        )
+    return cals[0]
+
+
+def sweep_events(cal) -> int:
+    """Delete every series titled PREFIX… in cal; return how many are left after."""
+    s = EK.EKEventStore.alloc().init()
+    cal = s.calendarWithIdentifier_(cal.calendarIdentifier())
+    lo, hi = datetime(2026, 9, 28), datetime(2030, 9, 1)
+
+    def mine():
+        pred = s.predicateForEventsWithStartDate_endDate_calendars_(
+            to_nsdate(lo), to_nsdate(hi), [cal]
+        )
+        evs = s.eventsMatchingPredicate_(pred) or []
+        return {str(e.eventIdentifier()) for e in evs if e.title().startswith(PREFIX)}
+
+    for ident in mine():
+        e = s.eventWithIdentifier_(ident)
+        if e is not None:
+            s.removeEvent_span_commit_error_(e, EK.EKSpanFutureEvents, True, None)
+    left = len(mine())
+    print(f"swept {CAL_TITLE} events from {SOURCE}/{EXISTING}: left={left}")
+    return left
 
 
 def occurrences(s, cal, title: str, lo: datetime, hi: datetime) -> list[datetime]:
@@ -208,7 +250,7 @@ def run_rrule(s, cal, shapes=SHAPES, sync_wait: int = 60) -> list[dict]:
             rows.append({**row, "verdict": "REJECTED at rule init", "error": str(ex)})
             continue
         e = EK.EKEvent.eventWithEventStore_(s)
-        e.setTitle_(name)
+        e.setTitle_(PREFIX + name)
         e.setStartDate_(to_nsdate(dtstart))
         e.setEndDate_(to_nsdate(dtstart + timedelta(hours=1)))
         e.setCalendar_(cal)
@@ -219,7 +261,7 @@ def run_rrule(s, cal, shapes=SHAPES, sync_wait: int = 60) -> list[dict]:
             continue
         ids[name] = str(e.eventIdentifier())
         back = from_ek(e.recurrenceRules()[0])
-        got = occurrences(s, cal, name, dtstart, hi)
+        got = occurrences(s, cal, PREFIX + name, dtstart, hi)
         ref = list(rrulestr(rrule, dtstart=dtstart).between(dtstart, hi, inc=True))
         ref_rfc = sorted(set(ref) | {dtstart})  # RFC 5545: DTSTART is always 1st
         saved_start = from_nsdate(e.startDate())
@@ -257,7 +299,7 @@ def run_rrule(s, cal, shapes=SHAPES, sync_wait: int = 60) -> list[dict]:
     # After iCloud sync: does the server hand back a different rule?
     if not sync_wait:
         return rows
-    print(f"waiting {sync_wait}s for iCloud sync, then re-reading rules …")
+    print(f"waiting {sync_wait}s for {SOURCE} sync, then re-reading rules …")
     time.sleep(sync_wait)
     s2 = EK.EKEventStore.alloc().init()
     s2.refreshSourcesIfNecessary()
@@ -429,6 +471,18 @@ def main() -> None:
         print(json.dumps(fn(*sys.argv[2:])))
         return
     s = EK.EKEventStore.alloc().init()
+    if EXISTING:
+        if mode != "rrule":
+            raise SystemExit("SPIKE_CALENDAR is for the rrule matrix only")
+        cal = existing_calendar(s)
+        sweep_events(cal)  # a previous crashed run
+        try:
+            res = run_rrule(s, cal, sync_wait=90)
+            name = f"results-rrule-{SOURCE.lower()}.json"
+            (HERE / name).write_text(json.dumps(res, indent=1))
+        finally:
+            sweep_events(cal)
+        return
     remove_scratch(s)  # a previous crashed run
     cal = scratch_calendar(s)
     try:
