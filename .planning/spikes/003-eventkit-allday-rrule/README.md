@@ -6,7 +6,7 @@ type: standard
 validates: "Given a scratch calendar in a non-UTC zone, when all-day and RRULE events are created, then each reads back on the correct days, or EventKit rejects it"
 verdict: VALIDATED
 related: [002]
-tags: [calendar, eventkit, rrule, all-day, timezone, dst, icloud]
+tags: [calendar, eventkit, rrule, all-day, timezone, dst, icloud, google-caldav]
 ---
 
 # Spike 003: EventKit all-day events and RRULE shapes
@@ -46,6 +46,9 @@ uv run --with python-dateutil python $P rrule   # 22 shapes + 60 s iCloud re-rea
 uv run --with python-dateutil python $P allday  # 3 creator zones × 4 reader zones
 uv run --with python-dateutil python $P weekno  # BYWEEKNO isolation
 uv run --with python-dateutil python $P gap     # all-day on a day with no midnight
+# Google refuses new calendars: run the matrix in an EXISTING calendar. Only events
+# titled "gsd-spike-003 …" are written, then deleted by id and by a sweep (left=0).
+SPIKE_SOURCE=Google SPIKE_CALENDAR=Personal uv run --with python-dateutil python $P rrule
 ```
 
 Each run creates `gsd-spike-003` in iCloud and removes it in a `finally`. Results land in
@@ -80,12 +83,18 @@ One line per shape (`EXACT`, `EXACT (DTSTART counted, RFC)`, `RULE CHANGED`,
 6. **After sync.** A fresh `EKEventStore` 60 s later, after `refreshSourcesIfNecessary`, held
    the same 22 rules. This does not prove the server stored them unchanged: the local cache
    can answer. No second device was checked.
-7. **Google.** The default calendar is on Google, which refuses a scratch calendar. Not tested,
-   because the only way to test is to write into a real Google calendar.
+7. **Google.** The default calendar for new events is Google/Personal, and Google refuses a
+   scratch calendar (`EKErrorDomain 17`). With the owner's approval, the matrix ran inside
+   Personal: every event was titled `gsd-spike-003 …` and deleted by id and by a sweep
+   (`left=0` before and after). The sweep path was first tested on an iCloud scratch
+   calendar. Result: identical to iCloud, with the same 22 verdicts and occurrence counts,
+   the same BYWEEKNO under-expansion, and no rule changed after a 90 s sync.
 
 ## Results
 
-**Verdict: VALIDATED.** Phase 3 criteria 1–2 are reachable with a known reject list.
+**Verdict: VALIDATED.** Phase 3 criteria 1–2 are reachable with a known reject list. The
+RRULE results are identical on iCloud and Google CalDAV (`results-rrule-icloud.json`,
+`results-rrule-google.json`).
 
 | Shape (RRULE) | Result |
 |---------------|--------|
@@ -113,8 +122,8 @@ One line per shape (`EXACT`, `EXACT (DTSTART counted, RFC)`, `RULE CHANGED`,
 
 **Open**
 
-- Google CalDAV fidelity: untested (see question at the end of the session).
-- Server-side storage: the after-sync re-read came from this Mac's cache; no second device
-  was checked.
-- DTSTART that does not match the rule: EventKit adds an extra first instance. Whether the
-  adapter should reject or accept it is a product decision.
+- Server-side storage: on both iCloud and Google the after-sync re-read may come from this
+  Mac's cache. No second device was checked.
+- DTSTART that does not match the rule: EventKit adds an extra first instance. Decided
+  (owner, 2026-09-28): accept with RFC 5545 semantics and state the extra first occurrence in
+  the Pointer summary.
