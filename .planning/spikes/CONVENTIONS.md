@@ -24,6 +24,10 @@ the question requires otherwise.
   `$SPIKE_PRIVATE_DIR` outside the repo (002, 004).
 - **Device writes use a scratch container** named `gsd-spike-NNN` (a Reminders list, an iCloud
   calendar). Remove it in a `finally`, then check that nothing is left (002, 003).
+  A source that refuses new containers (Google, `EKErrorDomain 17`) gets writes in an
+  existing container only with the owner's approval: every item titled `gsd-spike-NNN …`,
+  deleted by id and then by a sweep, with `left=0` checked before and after. Test the sweep
+  on a scratch container first (003).
 - **"Public API" means the SDK.** Grep the current SDK's headers and `.tbd`
   (`/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk`). A selector that exists only at
   runtime is private, even when it works (002, 004).
