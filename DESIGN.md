@@ -32,7 +32,8 @@ native data-plane adapter, so clean module boundaries are load-bearing.
 - **`Pointer(id, summary, deeplink)` IS the cockpit's citation grammar** (`[src:: system:id]` + an
   open-in-app deeplink) — pointers-not-payload by construction, which structurally avoids the archived
   flagship's context-bloat bug.
-- **EventKit on one dedicated, serialized worker thread** (`runtime.py`). `EKEventStore` has thread
+- **EventKit on one dedicated, serialized worker thread** (`runtime.py` owns the worker;
+  `eventkit.py` owns the store and every EventKit-typed call). `EKEventStore` has thread
   affinity and TCC auth must be handled on a consistent thread; a generic multi-worker pool risks
   affinity bugs and a hung first-permission call. Create the store on a single
   `ThreadPoolExecutor(max_workers=1)` at startup; serialize every EventKit call through it.
@@ -45,7 +46,8 @@ native data-plane adapter, so clean module boundaries are load-bearing.
 macos_apps_mcp/
   server.py        # FastMCP app: @mcp.tool() registrations = thin dispatch to adapters
   contracts.py     # Pointer + PointerSource Protocol (reads); typed write dataclasses
-  runtime.py       # the single serialized EventKit worker thread + native-call dispatch
+  runtime.py       # the single serialized native worker thread + osascript/sqlite dispatch
+  eventkit.py      # EKEventStore, NSDate/RRULE coercion, TCC consent — on runtime's worker
   errors.py        # pure NativeError taxonomy + write-policy helpers (no native imports)
   text.py          # pure text hygiene: control-strip, bounded truncation, match/verify norm
   audit.py         # write-audit JSONL trail + per-tool usage tally (storage, schema, middleware)

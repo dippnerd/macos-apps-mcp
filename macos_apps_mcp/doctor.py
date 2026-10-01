@@ -25,10 +25,11 @@ from pathlib import Path
 
 import EventKit as EK
 
-from . import deploy
+from . import deploy, registry, runtime
 from .adapters import mail_ids, mail_index
 from .errors import PRIVACY_PANE, NativeError, SchemaDrift
-from .runtime import app_process_info, request_access_each, run_native, run_osascript
+from .eventkit import request_access_each
+from .runtime import app_process_info, run_native
 
 # Apps reached via osascript/Automation — the adapters that aren't EventKit-native.
 # Part of the add-an-adapter checklist (CLAUDE.md "Architecture"): a new
@@ -164,7 +165,7 @@ def _automation_surfaces(request: bool) -> list[dict]:
             )
         else:
             try:
-                run_osascript(_PROBE, app, timeout=_PROBE_TIMEOUT)
+                runtime.run_osascript(_PROBE, app, timeout=_PROBE_TIMEOUT)
                 out.append(_surface(name, "automation", True, "ok"))
             except NativeError as e:
                 # #47 already fingerprinted it (automation_denied / app_not_running /
@@ -250,12 +251,7 @@ def _process_name(pid: int) -> str:
     """Best-effort executable path for a pid (no TCC needed). ponytail: immediate parent
     only — walk the ancestor chain to the first *.app if the .app is ever ambiguous."""
     try:
-        proc = subprocess.run(
-            ["ps", "-o", "comm=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        proc = runtime.tracked_run(["ps", "-o", "comm=", "-p", str(pid)], timeout=5.0)
     except (OSError, subprocess.SubprocessError):
         return f"pid {pid}"
     return proc.stdout.strip() or f"pid {pid}"
@@ -295,13 +291,14 @@ def _build_stamp() -> str:
 
 
 def _outbound_state() -> dict[str, list[str]]:
-    """``server.outbound_status()`` — registered vs configured outbound adapters
-    (#130, C6). Imported LOCALLY: ``server.py`` does ``from .doctor import diagnose``
-    at module level, so a module-level `import server` here would be circular — this
-    is the one place doctor.py reaches into server.py, and it does so lazily."""
-    from . import server
-
-    return server.outbound_status()
+    """The registered vs configured outbound adapters (#130, C6), read from the
+    registration record. doctor.py imports down into registry.py, never up into
+    server.py — the former lazy reach-in into the server module (a local import
+    inside this very function) is gone (GATE-03). Card 2 (GATE-04, RESEARCH
+    Pitfall 3): the registry is the ONE outbound ledger now — this used to read a
+    provisional second ledger in ``tiers.py`` that card 5 introduced before
+    ``registry.py`` existed."""
+    return registry.outbound_status()
 
 
 def _tcc_note(reasons: dict[str, str | None]) -> str:

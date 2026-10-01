@@ -24,6 +24,7 @@ import pytest
 
 from macos_apps_mcp import deploy, runtime
 from macos_apps_mcp.adapters import mail_addressing, mail_ids, mail_index
+from tests.envelope import SCHEMA, Envelope, seed_base
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -74,24 +75,35 @@ def sequoiaify_envelope(db: Path, side: Path) -> None:
     harvest would have produced from it (mapping + high-water mark). Idempotent:
     a store already reshaped (or one a test built deliberately broken) is left
     alone. The #201 battery's whole point is that production code then serves the
-    SAME queries through mode detection + ATTACH + shadow view, unmodified."""
+    SAME queries through mode detection + ATTACH + shadow view, unmodified.
+
+    Carries ``message_id`` across the reshape when the source table has it
+    (GATE-08): the earlier version copied only ``ROWID``, which silently NULLed
+    out ``message_id`` for every row — the exact column
+    ``build_sent_triage_query`` joins on (``g.message_id = m.message_id``), so a
+    reshaped store answered the sent-triage query with zero rows in sidecar mode
+    even though the same query worked fine in native mode."""
     conn = sqlite3.connect(db)
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(message_global_data)")}
         if "message_id_header" not in cols:
             return
+        has_message_id = "message_id" in cols
+        extra = ", message_id" if has_message_id else ""
         rows = conn.execute(
-            "SELECT ROWID, message_id_header FROM message_global_data"
+            f"SELECT ROWID, message_id_header{extra} FROM message_global_data"
             " WHERE message_id_header IS NOT NULL AND message_id_header <> ''"
         ).fetchall()
         (max_rowid,) = conn.execute(
             "SELECT COALESCE(MAX(ROWID), 0) FROM messages"
         ).fetchone()
+        copy_cols = "ROWID" + (", message_id" if has_message_id else "")
         conn.executescript(
             "ALTER TABLE message_global_data RENAME TO mgd_native;"
             "CREATE TABLE message_global_data("
             "ROWID INTEGER PRIMARY KEY, message_id INTEGER);"
-            "INSERT INTO message_global_data(ROWID) SELECT ROWID FROM mgd_native;"
+            f"INSERT INTO message_global_data({copy_cols})"
+            f" SELECT {copy_cols} FROM mgd_native;"
             "DROP TABLE mgd_native;"
         )
         conn.commit()
@@ -99,7 +111,13 @@ def sequoiaify_envelope(db: Path, side: Path) -> None:
         conn.close()
     sc = mail_ids._connect(side)  # the real schema, one source of truth
     try:
-        sc.executemany("INSERT OR REPLACE INTO global_ids VALUES (?, ?)", rows)
+        # global_ids is (global_message_id, message_id_header) only — rows may carry
+        # a third (message_id) column when the source had one; keep just the two
+        # the sidecar schema declares.
+        sc.executemany(
+            "INSERT OR REPLACE INTO global_ids VALUES (?, ?)",
+            [(r[0], r[1]) for r in rows],
+        )
         sc.execute(
             "INSERT OR REPLACE INTO meta VALUES ('max_rowid_harvested', ?)",
             (str(max_rowid),),
@@ -140,23 +158,64 @@ def envelope_mode(request, monkeypatch, tmp_path):
     return "sidecar"
 
 
+@pytest.fixture
+def fake_envelope(tmp_path, monkeypatch, envelope_mode):
+    """The shared Envelope Index fixture (GATE-08, #180): seeds
+    ``tmp_path / "Envelope Index"`` with ``seed_base``, points
+    ``mail_index.envelope_index_path`` at it, and returns an ``Envelope`` handle for
+    tests that need a few more rows on top of the canonical set.
+
+    Depends on ``envelope_mode``, so EVERY consumer of this fixture runs twice —
+    once native, once reshaped into the Sequoia shape with a Message-ID sidecar —
+    with no per-test opt-in required. Leaves ``mail_root`` untouched: the on-disk
+    ``.emlx`` plane is each test's own seam, this fixture only owns the sqlite
+    store."""
+    db = tmp_path / "Envelope Index"
+    seed_base(db)
+    monkeypatch.setattr(mail_index, "envelope_index_path", lambda: db)
+    return Envelope(db)
+
+
+@pytest.fixture
+def blank_envelope(tmp_path, monkeypatch, envelope_mode):
+    """Like ``fake_envelope``, but a SCHEMA-only store with no ``seed_base`` rows —
+    for a test that needs exact control over row counts (an arithmetic assertion,
+    or a specific url list) that layering onto the canonical seed would shift.
+    Still parametrized over ``envelope_mode``, so these queries get real
+    native+sidecar coverage too."""
+    db = tmp_path / "Envelope Index"
+    conn = sqlite3.connect(db)
+    conn.executescript(SCHEMA)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(mail_index, "envelope_index_path", lambda: db)
+    return Envelope(db)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_osascript(request, monkeypatch):
     """Fail CLOSED on the native seam: a unit test that forgets to fake it raises
-    instead of spawning osascript against real Mail (#176).
+    instead of spawning osascript, writing a real tempfile, or running a real
+    subprocess against a live app (#176, GATE-01).
 
-    Only reaches code that calls the seam qualified — ``runtime.run_osascript`` — which
-    since #176 is the whole mail plane; adapters still holding a module-global copy are
-    unaffected, and a test that patches ``runtime`` itself simply overrides this.
-    Integration tests (``-m integration``) must reach real apps, so they are exempt.
+    Covers all three seam names — ``run_osascript``, ``body_file``, ``tracked_run`` —
+    and only reaches code that calls each one qualified (``runtime.<seam>``); adapters
+    still holding a module-global copy are unaffected. A test's own
+    ``monkeypatch.setattr(runtime, <seam>, ...)`` simply overrides this fixture (last
+    write wins), and a seam's own self-tests bind the real function at test-module
+    import time instead (the ``tests/test_runtime.py`` convention for
+    ``run_osascript``/``body_file``). Integration tests (``-m integration``) must
+    reach real apps, so they are exempt.
     """
     if "integration" in request.keywords:
         return
 
-    def _refuse(*_args, **_kwargs):
-        raise AssertionError(
-            "a unit test reached run_osascript — fake it with "
-            "monkeypatch.setattr(runtime, 'run_osascript', ...)"
-        )
+    for seam in ("run_osascript", "body_file", "tracked_run"):
 
-    monkeypatch.setattr(runtime, "run_osascript", _refuse)
+        def _refuse(*_args, _seam=seam, **_kwargs):
+            raise AssertionError(
+                f"a unit test reached {_seam} — fake it with "
+                f"monkeypatch.setattr(runtime, '{_seam}', ...)"
+            )
+
+        monkeypatch.setattr(runtime, seam, _refuse)

@@ -1,0 +1,154 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-09-25T23:48:15.000Z",
+  "phase": "01",
+  "phase_name": "Gate — Land the Spiked Architecture Cuts",
+  "phase_dir": ".planning/phases/01-gate-land-the-spiked-architecture-cuts",
+  "plan": "01-14 (wave 11 of 11, owner stop: daemon swap + spike cleanup)",
+  "task": 0,
+  "total_tasks": 3,
+  "status": "paused",
+  "completed_tasks": [
+    {
+      "id": "01-01",
+      "name": "Cut release v0.11.0 and install daemon",
+      "status": "done",
+      "commit": "release f52e9d5, tag v0.11.0, PRs #211 #212"
+    },
+    {
+      "id": "01-02",
+      "name": "Card 1 part A: runtime seam lock",
+      "status": "done",
+      "commit": "dbcb326 1266f33 bfbb0ec on develop via PR #214"
+    },
+    {
+      "id": "01-03",
+      "name": "Card 9: timeout tripwire + _DEDUPE 900s",
+      "status": "done",
+      "commit": "0cfc0f0 36624be via PR #213"
+    },
+    {
+      "id": "01-04",
+      "name": "Card 1 part B + land card 1",
+      "status": "done",
+      "commit": "b5d8ece d6dd31d 7a3194b via PR #214"
+    },
+    {
+      "id": "01-05",
+      "name": "Card 4: recoverable() owns preflight",
+      "status": "done",
+      "commit": "3ba1c9a 0e13eb6 799355c via PR #215 (merged in 01-08)"
+    },
+    {
+      "id": "01-06",
+      "name": "Card 7: runtime.py split",
+      "status": "done",
+      "commit": "32d0f20 0603bb5 8627aa8 via PR #216"
+    },
+    {
+      "id": "01-07",
+      "name": "Card 3: shared envelope fixture",
+      "status": "done",
+      "commit": "1978bdd..26550d3 via PR #217"
+    },
+    {
+      "id": "01-08",
+      "name": "Owner device session",
+      "status": "done",
+      "commit": "card 7 EventKit 7/7; card 4 verified then merged via PR #215 (799355c)"
+    },
+    {
+      "id": "01-09",
+      "name": "Card 5: tier policy",
+      "status": "done",
+      "commit": "c7a9e88 a978551 bd6fe53 via PR #218"
+    },
+    {
+      "id": "01-10",
+      "name": "Dev-build daemon swap after card 5",
+      "status": "done",
+      "commit": "no commit; installed dev build bd6fe53, probe passed"
+    },
+    {
+      "id": "01-11",
+      "name": "Card 2 part A: registry + audit verbs from the record",
+      "status": "done",
+      "commit": "32af203 44bb96b 9bf35f6 on lane refactor/gate-card-2-registration-record (pushed, no PR until 01-13)"
+    },
+    {
+      "id": "01-12",
+      "name": "Card 2 part B: adapter/permission on records, notice from record, registry is the one outbound ledger",
+      "status": "done",
+      "commit": "4d2bd87 1df35ae 5fd28ae 60d953c db3219c on lane refactor/gate-card-2-registration-record (pushed)"
+    },
+    {
+      "id": "01-13",
+      "name": "Card 2 part C: dry-run defaults by construction; card 2 landed",
+      "status": "done",
+      "commit": "PR #219 rebase-merged, develop 8885ad0"
+    }
+  ],
+  "remaining_tasks": [
+    {
+      "id": "01-14",
+      "name": "Final dev-build check (owner stop) and spike cleanup (wave 11)",
+      "status": "not_started"
+    }
+  ],
+  "blockers": [
+    "The 2026-09-25/26 orchestrator session is Toyota-locked: gsd-tools.cjs is blocked, so the isolation sentinel cannot be renewed and the Agent isolation guard refuses sequential dispatch. Resume in a NEW chat."
+  ],
+  "async_jobs": [],
+  "human_actions_pending": [],
+  "decisions": [
+    {
+      "decision": "Isolation mode none (sequential dispatch from the main checkout); every plan makes its own .worktrees/<slug> lane",
+      "rationale": "Plans encode the repo lane rule; harness worktrees would nest lanes and delete .worktrees/.daemon_probe.py that 01-10/01-14 reuse",
+      "phase": "01"
+    },
+    {
+      "decision": "Same-wave plans run in parallel; executors write SUMMARY uncommitted and never touch STATE/ROADMAP/REQUIREMENTS; orchestrator commits tracking after each wave",
+      "rationale": "Plans in waves 2-4 share no files and work in separate lanes; only shared .planning writes could race",
+      "phase": "01"
+    },
+    {
+      "decision": "Requirements are ticked only at their LAST plan: GATE-01=01-04, GATE-08=01-07, GATE-02/09=01-08, GATE-10=01-09, GATE-06=01-11, GATE-03/04=01-12, GATE-05=01-13, GATE-13=01-14",
+      "rationale": "Executor for 01-01 ticked GATE-13 early; reverted",
+      "phase": "01"
+    },
+    {
+      "decision": "Owner answered cut-now at 01-01 Task 2",
+      "rationale": "Owner, 2026-09-25",
+      "phase": "01"
+    },
+    {
+      "decision": "Root pin bound to the plan's lane path; isolation forced to none via dispatch-isolation --force-isolation none",
+      "rationale": "The stock pin fails in a linked worktree; the isolation guard hook refuses dispatch while the sentinel says harness-worktree",
+      "phase": "01"
+    },
+    {
+      "decision": "Never dispatch 01-10/01-14 in harness-worktree mode",
+      "rationale": "A worktree agent's git and Write calls are confined to its own worktree; the 2026-09-25 attempt stopped before building, daemon untouched",
+      "phase": "01"
+    },
+    {
+      "decision": "01-10 Task 2 ran in the orchestrator session by owner choice",
+      "rationale": "Toyota lock blocked sentinel renewal; worktree-isolated executors cannot reach the main repo",
+      "phase": "01"
+    },
+    {
+      "decision": "01-14 Task 1 (blocking-human) answered by the owner: swap-and-clean",
+      "rationale": "Owner answer on 2026-09-26 in the orchestrator session; inventory then: 11 local spike branches, 0 on origin, 9 spike worktrees all clean. The next session passes this answer to the 01-14 executor and does not ask again.",
+      "phase": "01"
+    }
+  ],
+  "uncommitted_files": [
+    " M .planning/config.json (workflow._auto_chain_active=false, written by execute-phase)",
+    "?? .gsd/ (not from this session)",
+    "?? .planning/milestone.lock (not from this session)",
+    "?? .planning/phases/02.1-mail-fixes-batch-moves-fit-their-timeout-drafts-pick-their-a/ (another session)",
+    "?? .planning/state.json (another session)"
+  ],
+  "next_action": "In a NEW chat (not resumed): /gsd-execute-phase 1 — dispatches wave 8 (01-11).",
+  "context_notes": "Local develop carries unpushed .planning commits only. Sync with `git pull --rebase --autostash`. .worktrees/ holds only .daemon_probe.py (keep for 01-14). The isolation sentinel expires: re-run `dispatch-isolation --force-isolation none` before every dispatch. Pending todo: stale runtime.from_nsdate docstring in adapters/messages.py. A byte-identical backup of the v0.11.0 app sits in the 2026-09-25 session scratchpad (backup-v0.11.0-f52e9d5)."
+}

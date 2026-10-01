@@ -512,7 +512,7 @@ on run argv
   set AppleScript's text item delimiters to ""
   set out to ""
   set acted to {}
-  with timeout of 600 seconds
+  with timeout of 900 seconds
   tell application "Mail"
     -- FIRST PASS: delete. Verification is a SECOND pass below, deliberately — `delete`
     -- is asynchronous on both sides (§5c), so checking each message right after its own
@@ -682,6 +682,21 @@ def _split_ids(value) -> list[str]:
         if mid and mid not in out:
             out.append(mid)
     return out
+
+
+def _present_ids(src: tuple[str, str], ids: list[str]) -> dict[str, str]:
+    """The one spelling of the ``_PRESENT`` read: which of ``ids`` are stored in
+    mailbox ``src`` right now, keyed by the bare id each script echoes back. Every
+    dry-run preflight (move/trash/dedupe, via ``_presence`` below) and the public
+    ``presence()`` tool route through this single call site."""
+    return _parse_statuses(runtime.run_osascript(_PRESENT, *src, US.join(ids)))
+
+
+def _presence(src: tuple[str, str]) -> mail_recover.Present:
+    """``mail_recover.recoverable``'s ``present`` callable for one source mailbox —
+    reads each target's presence through AppleScript (never sqlite, #146: the index
+    lags Mail) so a dry run cannot report a target nobody actually checked."""
+    return lambda targets: _present_ids(src, [t.id for t in targets])
 
 
 # Mail's `flag index` values, in Mail's own menu order. Exposed as NAMES because an
@@ -1291,12 +1306,6 @@ class MailAdapter:
             )
             for mid in mids
         ]
-        if dry_run:
-            present = _parse_statuses(
-                runtime.run_osascript(_PRESENT, *src, US.join(mids))
-            )
-            targets = [replace(t, status=present.get(t.id, "missing")) for t in targets]
-            return mail_recover.preview("move", targets, destination=to_mailbox)
 
         def act(located):
             return _parse_statuses(
@@ -1309,7 +1318,14 @@ class MailAdapter:
                 )
             )
 
-        return mail_recover.recoverable("move", targets, act, destination=to_mailbox)
+        return mail_recover.recoverable(
+            "move",
+            targets,
+            act,
+            dry_run=dry_run,
+            present=_presence(src),
+            destination=to_mailbox,
+        )
 
     def trash_mail(self, ids, mailbox: str, dry_run: bool = True) -> dict:
         """Move messages to Trash — soft delete (#80), on #159's recoverable plane.
@@ -1361,13 +1377,6 @@ class MailAdapter:
         targets = [
             mail_recover.Target(id=mid, folder=mailbox, account=account) for mid in mids
         ]
-        if dry_run:
-            present = _parse_statuses(
-                runtime.run_osascript(_PRESENT, *src, US.join(mids))
-            )
-            targets = [replace(t, status=present.get(t.id, "missing")) for t in targets]
-            return mail_recover.preview("trash", targets, destination=trash)
-
         dst = mail_addressing.mailbox_args(trash)
 
         def act(located):
@@ -1381,7 +1390,14 @@ class MailAdapter:
                 )
             )
 
-        return mail_recover.recoverable("trash", targets, act, destination=trash)
+        return mail_recover.recoverable(
+            "trash",
+            targets,
+            act,
+            dry_run=dry_run,
+            present=_presence(src),
+            destination=trash,
+        )
 
     def duplicates(self, limit: int = MAX_MAILS) -> dict:
         """Where the redundant copies are (#140/#153) — READ-ONLY, sqlite only.
@@ -1441,7 +1457,7 @@ class MailAdapter:
         if not mids:
             return {}
         src = mail_addressing.mailbox_args(mailbox)
-        return _parse_statuses(runtime.run_osascript(_PRESENT, *src, US.join(mids)))
+        return _present_ids(src, mids)
 
     def dedupe_batch(self, ids, mailbox: str, dry_run: bool = True) -> dict:
         """Collapse each named Message-ID's same-mailbox copies down to one (#140).
@@ -1457,6 +1473,12 @@ class MailAdapter:
         un-truncated action log still records every id, its mailbox and its receipt,
         which is what makes the pass auditable and undoable while Trash holds the
         losers.
+
+        A dry run now reads presence through AppleScript too (GATE-09, one bounded
+        ``_PRESENT`` call over the batch — capped like every id-addressed write here):
+        it can no longer report "planned" for ids nobody checked, the same preflight
+        ``move_mail``/``trash_mail`` get. The CLI (#140/#153) only ever calls this with
+        ``dry_run=False``, so that caller's behaviour is unchanged.
         """
         mids = _split_ids(ids)
         mail_recover.check_batch(mids)
@@ -1475,8 +1497,6 @@ class MailAdapter:
         targets = [
             mail_recover.Target(id=mid, folder=mailbox, account=account) for mid in mids
         ]
-        if dry_run:
-            return mail_recover.preview("dedupe", targets, destination=trash)
         dst = mail_addressing.mailbox_args(trash)
 
         def act(located):
@@ -1497,7 +1517,13 @@ class MailAdapter:
             }
 
         return mail_recover.recoverable(
-            "dedupe", targets, act, destination=trash, backup=False
+            "dedupe",
+            targets,
+            act,
+            dry_run=dry_run,
+            present=_presence(src),
+            destination=trash,
+            backup=False,
         )
 
     def undo(self, receipt_id: str, dry_run: bool = True) -> dict:

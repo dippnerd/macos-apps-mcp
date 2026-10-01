@@ -1,13 +1,21 @@
-"""#176: the mail adapters reach the native seam QUALIFIED — ``runtime.run_osascript``.
+"""#176/GATE-01: every adapter + doctor reach the native seam QUALIFIED —
+``runtime.run_osascript`` / ``runtime.body_file`` / ``runtime.tracked_run``.
 
-``from ..runtime import run_osascript`` lands a *copy* of the seam in the importing
-module's namespace, so a test has to fake it once per module — and a forgotten module
-fails OPEN: the call spawns osascript against real Mail (that is #160, where a send
-tool did exactly that). Qualified calls mean one patch point, ``runtime``, however many
-modules the mail adapter splits into.
+``from ..runtime import run_osascript`` (etc.) lands a *copy* of the seam in the
+importing module's namespace, so a test has to fake it once per module — and a
+forgotten module fails OPEN: the call spawns osascript against real Mail (that is
+#160, where a send tool did exactly that) or a real ``tracked_run`` subprocess.
+Qualified calls mean one patch point, ``runtime``, however many modules the codebase
+splits into. The runtime half of the lock — a unit test that forgets to fake a seam
+raises instead of reaching a live app — lives in ``tests/conftest.py``'s autouse
+``_no_real_osascript`` fixture; the self-tests below prove it fires.
 
-Every ``adapters/mail*.py`` is covered, so the modules #178 splits out inherit the rule
-without anyone remembering to add them here.
+Every ``adapters/*.py`` (except ``__init__.py``) plus ``doctor.py`` is covered, so a
+NEW module inherits the rule without anyone remembering to add it here (card 1).
+
+The AST tests also forbid a direct ``subprocess`` spawn (``run``/``Popen``/``call``/
+``check_call``/``check_output``) in these modules — the only door to a subprocess is
+``runtime.tracked_run`` (GATE-11).
 """
 
 from __future__ import annotations
@@ -17,16 +25,19 @@ import pathlib
 
 import pytest
 
-_SEAM = frozenset({"run_osascript", "body_file"})
-_MAIL_MODULES = sorted(
-    (pathlib.Path(__file__).parent.parent / "macos_apps_mcp" / "adapters").glob(
-        "mail*.py"
-    )
+from macos_apps_mcp import runtime
+
+_SEAM = frozenset({"run_osascript", "body_file", "tracked_run"})
+_SPAWNERS = frozenset({"run", "Popen", "call", "check_call", "check_output"})
+_ADAPTERS_DIR = pathlib.Path(__file__).parent.parent / "macos_apps_mcp" / "adapters"
+_NATIVE_MODULES = sorted(
+    [p for p in _ADAPTERS_DIR.glob("*.py") if p.name != "__init__.py"]
+    + [_ADAPTERS_DIR.parent / "doctor.py"]
 )
 
 
-@pytest.mark.parametrize("path", _MAIL_MODULES, ids=lambda p: p.name)
-def test_mail_module_does_not_import_the_seam_by_name(path):
+@pytest.mark.parametrize("path", _NATIVE_MODULES, ids=lambda p: p.name)
+def test_native_module_does_not_import_the_seam_by_name(path):
     tree = ast.parse(path.read_text(), filename=str(path))
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("runtime"):
@@ -38,6 +49,65 @@ def test_mail_module_does_not_import_the_seam_by_name(path):
             )
 
 
-def test_the_tripwire_sees_the_mail_modules():
-    # A glob that matches nothing would make every assertion above vacuous.
-    assert len(_MAIL_MODULES) >= 3
+@pytest.mark.parametrize("path", _NATIVE_MODULES, ids=lambda p: p.name)
+def test_native_module_spawns_no_subprocess_directly(path):
+    # a direct subprocess spawn skips the #56 cleanup registry AND the conftest lock
+    # runtime.tracked_run gives every other seam call (GATE-11). Only ast.Call nodes
+    # are checked — a bare `subprocess.TimeoutExpired` exception-class reference
+    # (shortcuts.py) is not a spawn and must not be flagged.
+    tree = ast.parse(path.read_text(), filename=str(path))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+            and node.func.attr in _SPAWNERS
+        ) or (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "subprocess"
+            and _SPAWNERS.intersection(a.name for a in node.names)
+        ):
+            raise AssertionError(
+                f"{path.name}:{node.lineno} spawns a process directly — call "
+                "runtime.tracked_run(...) qualified so the conftest lock fakes or "
+                "refuses it (GATE-11)"
+            )
+
+
+def test_the_tripwire_sees_the_native_modules():
+    # A glob that matches nothing (or too few) would make every assertion above
+    # vacuous — assert it actually sees the whole native plane, doctor.py and
+    # shortcuts.py included (GATE-01 empty edge).
+    assert len(_NATIVE_MODULES) >= 10
+    names = {p.name for p in _NATIVE_MODULES}
+    assert "doctor.py" in names
+    assert "shortcuts.py" in names
+
+
+# --- runtime lock self-tests (GATE-01, #176 runtime half) -----------------------------
+#
+# The AST tests above catch a *static* regression — a by-name import. They cannot
+# catch a *new* test that calls ``runtime.<seam>`` qualified for real. That is what
+# conftest.py's autouse ``_no_real_osascript`` fixture is for; these tests prove it
+# actually fires, for each of the three seam names.
+
+
+@pytest.mark.parametrize("seam", sorted(["run_osascript", "body_file", "tracked_run"]))
+def test_unit_tests_cannot_reach_a_seam_unfaked(seam):
+    # a unit test that forgets to fake a seam must fail closed, not spawn a real
+    # process or write a real tempfile against a live app.
+    with pytest.raises(AssertionError, match=seam):
+        getattr(runtime, seam)("x")
+
+
+def test_a_test_fake_overrides_the_lock(monkeypatch):
+    # a test's own monkeypatch of a seam name overrides the autouse lock (the lock
+    # applies first, so whatever a test sets afterwards is what runs) — this is what
+    # lets every other test in the suite fake the seam it needs instead of being
+    # permanently refused.
+    def fake(*_args, **_kwargs):
+        return object()
+
+    monkeypatch.setattr(runtime, "body_file", fake)
+    assert runtime.body_file is fake

@@ -12,133 +12,29 @@ import inspect
 
 from fastmcp import Client
 
+import macos_apps_mcp.registry as registry
 import macos_apps_mcp.server as srv
+import macos_apps_mcp.tiers as tiers
 
-# Writes that only ADD a new item (create/open) — not read-only, but not destructive.
+# Card 2 (GATE-04): these three used to be hand-maintained tables. They are now VIEWS
+# over registry.TOOLS — the record set by server.py's _tool(...) decorator at
+# registration — so a new tool cannot silently skip classification by being forgotten
+# in a second, parallel edit. tests/test_registry.py pins the develop-era literals
+# (frozen there BEFORE this refactor) against these views, so the move changes no fact.
 _ADDITIVE_TOOLS = frozenset(
-    {
-        "create_reminder",
-        "create_event",
-        "create_contact",
-        "safari_open",
-        "create_draft",
-        "mail_reply",
-        "create_note",
-        "create_mailbox",
-        "save_mail_attachment",
-        "export_mail",
-        "music_control",
-        "play_playlist",
-        "set_volume",
-        "set_mode",
-    }
+    n for n, r in registry.TOOLS.items() if r.tier == "additive"
 )
-# Writes that modify/overwrite/delete existing state, or run arbitrary automation.
+# Writes that modify/overwrite/delete existing state, or run arbitrary automation —
+# the destructive tier plus outbound sends (both destructiveHint=True, #57).
 _DESTRUCTIVE_TOOLS = frozenset(
-    {
-        "update_reminder",
-        "complete_reminder",
-        "update_event",
-        "delete_event",
-        "delete_note",
-        "run_shortcut",
-        "update_note",
-        "delete_draft",
-        "move_mail",
-        "trash_mail",
-        "mail_undo",
-        "update_mail_status",
-        "send_mail",
-        "reply_all",
-        "forward_mail",
-    }
+    n for n, r in registry.TOOLS.items() if r.tier in ("destructive", "send")
 )
 # The full write half of the read/write seam. Everything else is read-only.
 _WRITE_TOOLS = _ADDITIVE_TOOLS | _DESTRUCTIVE_TOOLS
 
-# The permission keyword(s) each tool's docstring must name — a tuple when the tool
-# needs more than one grant (None = meta tool, no keyword).
-_PERMISSION = {
-    "ping": None,
-    "now": None,
-    "doctor": None,
-    "audit": None,
-    "usage": None,
-    "reminders": "EventKit",
-    "events": "EventKit",
-    "free_busy": "EventKit",
-    "reminder_lists": "EventKit",
-    "calendars": "EventKit",
-    "create_reminder": "EventKit",
-    "update_reminder": "EventKit",
-    "complete_reminder": "EventKit",
-    "create_event": "EventKit",
-    "update_event": "EventKit",
-    "delete_event": "EventKit",
-    "contacts": "Automation",
-    "mail": "Automation",
-    "mail_body": "Automation",
-    "mail_bodies": "Full Disk Access",
-    "mail_attachments": "Automation",
-    "mail_needs_response": "Automation",
-    "mail_awaiting_reply": "Automation",
-    # #161a: it reads .emlx at rest and never launches Mail — FDA, not Automation. It
-    # stays read-tier although it writes the FTS sidecar; see the comment on the tool.
-    "mail_index_bodies": "Full Disk Access",
-    # #201: same shape — .emlx headers at rest into OUR sidecar, no Mail launch.
-    "mail_index_ids": "Full Disk Access",
-    "mail_thread": "Full Disk Access",
-    # counts are sqlite (FDA), account NAMES go through osascript — which launches
-    # Mail — so this tool genuinely needs both and must say both.
-    "mail_overview": ("Full Disk Access", "Automation"),
-    # account= as a display NAME is resolved through Mail, and the AppleScript inbox
-    # search is still the drift fallback; the index itself is read at rest under FDA.
-    "mail_search": ("Full Disk Access", "Automation"),
-    "create_draft": "Automation",
-    "mail_reply": "Automation",
-    "drafts": "Automation",
-    "delete_draft": "Automation",
-    "create_mailbox": ("Automation", "Full Disk Access"),
-    # #85: pure sqlite over the Envelope Index — never launches Mail.
-    "mail_stats": "Full Disk Access",
-    # #85: the message bytes are read AT REST; nothing here talks to Mail.
-    "export_mail": "Full Disk Access",
-    # #81: the save is Automation; resolving a bare message_id is the index (FDA).
-    "save_mail_attachment": ("Automation", "Full Disk Access"),
-    # the move is Automation; locating each message's .emlx for the #159 backup is FDA.
-    "move_mail": ("Automation", "Full Disk Access"),
-    # the delete is Automation; the #159 backup + the account's Trash url are FDA.
-    "trash_mail": ("Automation", "Full Disk Access"),
-    "mail_undo": ("Automation", "Full Disk Access"),
-    # pure sqlite over the Envelope Index — never launches Mail.
-    "mail_duplicates": "Full Disk Access",
-    "update_mail_status": "Automation",
-    "send_mail": "Automation",
-    "reply_all": "Automation",
-    "forward_mail": "Automation",
-    "notes": "Automation",
-    "notes_all": "Automation",
-    "note_bodies": "Automation",
-    "photos": "Automation",
-    "messages_chats": "Automation",
-    "messages_search": "Full Disk Access",
-    "messages_with": "Full Disk Access",
-    "message_body": "Full Disk Access",
-    "safari_tabs": "Automation",
-    "delete_note": "Automation",
-    "create_note": "Automation",
-    "update_note": "Automation",
-    "create_contact": "Automation",
-    "safari_open": "Automation",
-    "shortcuts": "Shortcuts CLI",
-    "run_shortcut": "Shortcuts CLI",
-    "music_search": "Automation",
-    "now_playing": "Automation",
-    "music_control": "Automation",
-    "play_playlist": "Automation",
-    "set_volume": "Automation",
-    "set_mode": "Automation",
-}
+# The permission keyword(s) each tool's docstring must name — () for a meta tool (no
+# keyword). A view over the record's own `permission` field.
+_PERMISSION = {n: r.permission for n, r in registry.TOOLS.items()}
 
 
 def _tools():
@@ -171,8 +67,10 @@ def test_run_shortcut_carries_open_world_hint():
     # carries openWorldHint — but it stays in the destructive write tier, NOT the send
     # tier: most shortcuts are local ("unknown world" is the honest label), and the
     # send tier would silently unregister the tool for every existing user.
-    by_name = {t.name: t for t in _tools()}
-    assert by_name["run_shortcut"].annotations.openWorldHint is True
+    # Read the record directly (every record, registered or not, GATE-07/D-01) —
+    # run_shortcut is gated off under MACOS_APPS_READ_ONLY=1, so the live FastMCP
+    # tool list never contains it in that mode.
+    assert registry.TOOLS["run_shortcut"].annotations["openWorldHint"] is True
 
 
 def test_permission_map_matches_registered_tools():
@@ -192,20 +90,22 @@ def test_every_tool_docstring_states_permission_and_is_nontrivial():
     for t in _tools():
         doc = t.description or ""
         assert len(doc) > 20, f"{t.name} docstring is too thin"
-        keyword = _PERMISSION[t.name]
-        if keyword is None:
-            continue
-        # A tuple means the tool needs SEVERAL grants (e.g. sqlite counts under Full
-        # Disk Access plus an osascript label lookup under Automation) — the docstring
-        # has to name every one of them, not just the cheapest.
-        for kw in (keyword,) if isinstance(keyword, str) else keyword:
+        # A record's permission is a tuple — several entries mean the tool needs
+        # SEVERAL grants (e.g. sqlite counts under Full Disk Access plus an osascript
+        # label lookup under Automation), so the docstring has to name every one of
+        # them, not just the cheapest. () = meta tool, nothing to assert.
+        for kw in _PERMISSION[t.name]:
             assert kw.lower() in doc.lower(), (
                 f"{t.name} docstring must name its permission ({kw!r})"
             )
 
 
 def test_every_write_tool_is_audit_classified():
-    import macos_apps_mcp.server as srv
+    # Read registry.TOOLS directly (every record, registered or not, GATE-07/D-01) —
+    # registry.write_tools()/snapshot_sources() filter to r.registered, which is
+    # empty under MACOS_APPS_READ_ONLY=1. registry.TOOLS keeps send_mail/reply_all/
+    # forward_mail in every mode, so they are envelope_only unconditionally rather
+    # than gated on tiers.allow_send("mail").
 
     # writes with no id-addressed before-state: creates + non-id actions
     envelope_only = {
@@ -228,10 +128,15 @@ def test_every_write_tool_is_audit_classified():
         "play_playlist",
         "set_volume",
         "set_mode",
+        "send_mail",
+        "reply_all",
+        "forward_mail",
     }
-    if srv._allow_send("mail"):
-        envelope_only |= {"send_mail", "reply_all", "forward_mail"}
-    assert set(srv._SNAPSHOT_SOURCES) | envelope_only == srv._WRITE_TOOLS
+    all_writes = {n for n, r in registry.TOOLS.items() if r.is_write}
+    all_snapshot_sources = {
+        n for n, r in registry.TOOLS.items() if r.snapshot is not None
+    }
+    assert all_snapshot_sources | envelope_only == all_writes
 
 
 # #159: a destructive MAIL write either rides the recoverable plane (backup → log →
@@ -256,11 +161,18 @@ def _mail_tools() -> set[str]:
     dispatch bodies, never hand-listed, so a new mail tool cannot skip the check below
     by being forgotten in a set."""
     tree = ast.parse(inspect.getsource(srv))
-    return {
+    observed = {
         node.name
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and "_mail." in ast.unparse(node)
     }
+    # Card 2: the record DECLARES adapter="mail" at each call site; this AST pass is
+    # the independent oracle that catches a declaration that lies (or a mail dispatch
+    # declared under a different adapter name).
+    assert observed == registry.by_adapter("mail"), observed ^ registry.by_adapter(
+        "mail"
+    )
+    return observed
 
 
 def test_every_destructive_mail_write_is_recoverable_or_documented_as_exempt():
@@ -284,7 +196,7 @@ def test_send_tools_registered_only_when_gate_is_on():
     # `MACOS_APPS_ALLOW_SEND=mail uv run pytest` must exercise and pass.
     live = {t.name for t in _tools()}
     send_tools = {"send_mail", "reply_all", "forward_mail"}
-    if srv._allow_send("mail"):
+    if tiers.allow_send("mail"):
         assert send_tools <= live
     else:
         assert not (send_tools & live)

@@ -20,6 +20,7 @@ import html
 import zlib
 from pathlib import Path
 
+from .. import runtime
 from ..contracts import NoteData, Pointer, deletion_result
 from ..errors import (
     NativeError,
@@ -27,7 +28,7 @@ from ..errors import (
     VerificationFailed,
     verify_persisted,
 )
-from ..runtime import body_file, read_via_sqlite, run_osascript
+from ..runtime import read_via_sqlite
 from ..text import (
     RS,
     STRIP_FRAMING,
@@ -560,7 +561,9 @@ class NotesAdapter:
             # "(untitled note)" and would spuriously match "note"/"untitled" (#64
             # review). An empty raw title folds to "" and matches nothing, like the
             # sqlite path (raw ZTITLE1 → "") and the old `whose name contains`.
-            recs = parse_framed(run_osascript(_LIST_ALL), _ALL_FIELDS, min_fields=1)
+            recs = parse_framed(
+                runtime.run_osascript(_LIST_ALL), _ALL_FIELDS, min_fields=1
+            )
             kept = [r for r in recs if needle in fold_text(r["title"])]
             return _all_pointers(kept[:MAX_NOTES])
 
@@ -591,7 +594,7 @@ class NotesAdapter:
             NOTESTORE,
             _FINGERPRINT,
             read,
-            fallback=lambda: _parse_all(run_osascript(_LIST_ALL))[:MAX_NOTES],
+            fallback=lambda: _parse_all(runtime.run_osascript(_LIST_ALL))[:MAX_NOTES],
             immutable=False,  # mode=ro reads the -wal (live); see module note
         )
 
@@ -694,7 +697,7 @@ class NotesAdapter:
     def _applescript_title(self, ident: str) -> str | None:
         """Fallback title read (no FDA): `name of note id`. Unknown/stale id → None
         (the script returns "" for it), matching the sqlite path's contract."""
-        return run_osascript(_TITLE_BY_ID, ident) or None
+        return runtime.run_osascript(_TITLE_BY_ID, ident) or None
 
     def _applescript_bodies(self, ids: list[str]) -> list[dict]:
         """The osascript body reader (fallback + gap-fill path). Unknown ids skipped;
@@ -703,7 +706,7 @@ class NotesAdapter:
             return []
         return [
             {"id": rec["id"], "body": _hydrate_body(rec["body"])}
-            for rec in _parse_bodies(run_osascript(_BODIES, *ids))
+            for rec in _parse_bodies(runtime.run_osascript(_BODIES, *ids))
         ]
 
     def delete(
@@ -727,7 +730,7 @@ class NotesAdapter:
         # one argv shape for both paths — preview and real delete MUST see the same args
         args = (ident,) if expect_title is None else (ident, expect_title)
         if dry_run:
-            title = run_osascript(_PREVIEW_DELETE, *args)
+            title = runtime.run_osascript(_PREVIEW_DELETE, *args)
             return deletion_result(
                 ident,
                 Pointer(
@@ -736,7 +739,7 @@ class NotesAdapter:
                     deeplink="",
                 ),
             )
-        run_osascript(_DELETE, *args)
+        runtime.run_osascript(_DELETE, *args)
         return deletion_result(ident, None)
 
     def create(self, data: NoteData) -> Pointer:
@@ -748,8 +751,8 @@ class NotesAdapter:
         verified by a re-read (#49) before it's trusted.
         """
         html_body = _compose_html(data.title, data.body)
-        with body_file(html_body) as path:
-            ident = run_osascript(_CREATE_NOTE, data.folder or "", path).strip()
+        with runtime.body_file(html_body) as path:
+            ident = runtime.run_osascript(_CREATE_NOTE, data.folder or "", path).strip()
         _verify_note(self._read_title_by_id(ident), ident, data)
         return Pointer(
             id=ident,
@@ -758,12 +761,51 @@ class NotesAdapter:
             folder=data.folder,
         )
 
-    def update(self, ident: str, data: NoteData) -> Pointer:
+    def _update_preview(self, ident: str, data: NoteData) -> dict:
+        """The D-02 read-only preview body for ``update``'s ``dry_run=True`` path —
+        split out so the public method stays a thin dispatch between the two paths.
+        Reads the current title/body via the sqlite-primary planes (a read IS allowed
+        in this preview); an unknown id raises the same-shaped ``ValueError`` the real
+        update's verify step would eventually surface."""
+        title = self._read_title_by_id(ident)
+        if title is None:
+            raise ValueError(f"update_note: unknown note id {ident!r}")
+        bodies = self.get_bodies([ident])
+        current_body = bodies[0]["body"] if bodies else ""
+        current: dict[str, object] = {
+            "title": clean_summary(title) or "(untitled note)",
+            "body_chars": len(current_body),
+        }
+        if "[truncated " in current_body or current_body.startswith("[not hydrated:"):
+            current["body_truncated"] = True
+        return {
+            "dry_run": True,
+            "would_update": {
+                "id": ident,
+                "current": current,
+                "new": {
+                    "title": clean_summary(data.title) or "(untitled note)",
+                    "body_chars": len(data.body),
+                },
+            },
+        }
+
+    def update(self, ident: str, data: NoteData, *, dry_run: bool = False) -> dict:
         """Full-replace a note's title+body by id; the id must survive (verified, #49).
 
         `data.folder` is REFUSED on update — moving a note between folders is not
         supported (a separate op if ever needed); silently ignoring it would let a
         caller believe the note moved. Body transport and verify match `create`.
+
+        `dry_run=True` (D-02) reads the note's CURRENT title (`_read_title_by_id`) and
+        body (`get_bodies`) and reports them against the new title/body SIZES — a read
+        is allowed in this preview (the "no native call" rule is for outbound sends,
+        not this local read), but it makes NO Notes write: `_UPDATE_NOTE` and
+        `body_file` never fire. An unknown id raises the same-shaped `ValueError` the
+        real update's verify step would eventually surface, so the preview can never
+        promise a write the real call would refuse. `notes.snapshot` is title-only
+        (#67), so this is the only before-state a full-replace update gets — reason
+        enough for it to be in the "removes or replaces content" class (GATE-05, D-04).
         """
         if not ident.strip():
             raise ValueError("update_note needs a note id")
@@ -772,9 +814,11 @@ class NotesAdapter:
                 "update_note cannot move a note between folders — omit `folder` "
                 "(the note stays where it is; only title/body are replaced)"
             )
+        if dry_run:
+            return self._update_preview(ident, data)
         html_body = _compose_html(data.title, data.body)
-        with body_file(html_body) as path:
-            ident_after = run_osascript(_UPDATE_NOTE, ident, path).strip()
+        with runtime.body_file(html_body) as path:
+            ident_after = runtime.run_osascript(_UPDATE_NOTE, ident, path).strip()
         _verify_note(
             self._read_title_by_id(ident_after),
             ident_after,
@@ -785,4 +829,4 @@ class NotesAdapter:
             id=ident_after,
             summary=clean_summary(data.title) or "(untitled note)",
             deeplink="",
-        )
+        ).as_dict()

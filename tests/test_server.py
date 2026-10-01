@@ -13,7 +13,10 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 
+import macos_apps_mcp.notices as notices
+import macos_apps_mcp.registry as registry
 import macos_apps_mcp.server as srv
+import macos_apps_mcp.tiers as tiers
 from macos_apps_mcp.contracts import (
     CLEAR_RECURRENCE,
     CalendarEventData,
@@ -24,6 +27,16 @@ from macos_apps_mcp.contracts import (
     read_result,
 )
 from macos_apps_mcp.errors import AppNotRunning, AutomationDenied
+
+# The 8 tests below assert "srv.<tool> raises ToolError" — true only when the write
+# tier is registered: a gated-off tool's dispatch function is returned undecorated,
+# without _guard (server.py's _tool), so a raw ValueError/NativeError escapes
+# instead. Absence of the gated-off tool is proven separately by
+# test_gate_on_dispatch.py; skipping here loses nothing.
+_write_gate_on_only = pytest.mark.skipif(
+    tiers.read_only(),
+    reason="valid only when write tools are registered (see server.py's _tool gate)",
+)
 
 
 class _FakeSource:
@@ -65,9 +78,18 @@ class _FakeSource:
         self.queries.append(("create", data.title, data.body, data.folder))
         return Pointer(id="x-coredata://S/ICNote/p9", summary=data.title, deeplink="")
 
-    def update(self, ident, data):
+    def update(self, ident, data, *, dry_run=False):
         self.queries.append(("update", ident, data.title, data.body))
-        return Pointer(id=ident, summary=data.title, deeplink="")
+        if dry_run:
+            return {
+                "dry_run": True,
+                "would_update": {
+                    "id": ident,
+                    "current": {"title": "Old", "body_chars": 3},
+                    "new": {"title": data.title, "body_chars": len(data.body)},
+                },
+            }
+        return {"id": ident, "summary": data.title, "deeplink": ""}
 
 
 def test_server_constructs():
@@ -353,8 +375,22 @@ def test_update_event_builds_typed_payload(monkeypatch):
 def test_delete_event_dispatches(monkeypatch):
     fake = _FakeWriter()
     monkeypatch.setattr(srv, "_calendar", fake)
-    out = srv.delete_event("E-1")
+    out = srv.delete_event("E-1", dry_run=False)  # GATE-05 (D-01): default is now True
     assert fake.calls[0] == ("delete_event", "E-1", None) and out == {"deleted": "E-1"}
+
+
+def test_delete_event_bare_call_previews(monkeypatch):
+    # GATE-05 (D-01): a bare call (no dry_run) now previews — the default flipped.
+    calls = []
+
+    class _Cal:
+        def delete_event(self, ident, span=None, dry_run=False):
+            calls.append((ident, span, dry_run))
+            return {"dry_run": True, "would_delete": {}}
+
+    monkeypatch.setattr(srv, "_calendar", _Cal())
+    srv.delete_event("E-1")
+    assert calls == [("E-1", None, True)]
 
 
 def test_update_event_passes_span(monkeypatch):
@@ -397,6 +433,7 @@ def test_create_reminder_passes_priority_and_start(monkeypatch):
     assert data.priority == 1 and data.start == datetime(2026, 6, 25, 9, 0)
 
 
+@_write_gate_on_only
 def test_create_reminder_rejects_out_of_range_priority(monkeypatch):
     monkeypatch.setattr(srv, "_reminders", _FakeWriter())
     with pytest.raises(ToolError, match="priority must be"):
@@ -423,6 +460,7 @@ def test_create_event_all_day_accepts_date_only(monkeypatch):
     assert data.start == datetime(2026, 7, 1) and data.end == datetime(2026, 7, 2)
 
 
+@_write_gate_on_only
 def test_create_event_all_day_rejects_utc_offset(monkeypatch):
     # an all-day instant with a UTC offset can land on the wrong calendar day —
     # rejected with the date-only hint, prefixed by the failing param's label.
@@ -436,6 +474,7 @@ def test_create_event_all_day_rejects_utc_offset(monkeypatch):
         )
 
 
+@_write_gate_on_only
 def test_update_event_all_day_rejects_utc_offset(monkeypatch):
     monkeypatch.setattr(srv, "_calendar", _FakeWriter())
     with pytest.raises(ToolError, match="date-only"):
@@ -472,6 +511,7 @@ def test_create_reminder_parses_recurrence(monkeypatch):
     assert data.recurrence == Recurrence(frequency="daily")
 
 
+@_write_gate_on_only
 def test_create_reminder_recurrence_without_due_rejected(monkeypatch):
     monkeypatch.setattr(srv, "_reminders", _FakeWriter())
     with pytest.raises(ToolError, match="needs a due date"):
@@ -509,6 +549,7 @@ def test_update_reminder_recurrence_rrule_parses(monkeypatch):
     assert data.recurrence == Recurrence(frequency="daily")
 
 
+@_write_gate_on_only
 def test_create_event_rejects_bad_rrule(monkeypatch):
     monkeypatch.setattr(srv, "_calendar", _FakeWriter())
     with pytest.raises(ToolError, match="unsupported RRULE"):
@@ -556,6 +597,7 @@ def test_safari_open_dispatches(monkeypatch):
     }
 
 
+@_write_gate_on_only
 def test_create_event_rejects_empty_start():
     # Required event dates fail clearly at the tool boundary, not as an obscure
     # worker-thread crash: the label prefixes contracts.parse_datetime's message
@@ -567,18 +609,18 @@ def test_create_event_rejects_empty_start():
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "Yes"])
 def test_read_only_truthy(monkeypatch, val):
     monkeypatch.setenv("MACOS_APPS_READ_ONLY", val)
-    assert srv._read_only() is True
+    assert tiers.read_only() is True
 
 
 @pytest.mark.parametrize("val", ["", "0", "no", "false", "off"])
 def test_read_only_falsy(monkeypatch, val):
     monkeypatch.setenv("MACOS_APPS_READ_ONLY", val)
-    assert srv._read_only() is False
+    assert tiers.read_only() is False
 
 
 def test_read_only_unset_is_false(monkeypatch):
     monkeypatch.delenv("MACOS_APPS_READ_ONLY", raising=False)
-    assert srv._read_only() is False
+    assert tiers.read_only() is False
 
 
 @pytest.mark.parametrize(
@@ -602,27 +644,27 @@ def test_read_only_unset_is_false(monkeypatch):
 def test_allow_send_parse(monkeypatch, val, want):
     monkeypatch.delenv("MACOS_APPS_READ_ONLY", raising=False)
     monkeypatch.setenv("MACOS_APPS_ALLOW_SEND", val)
-    assert srv._allow_send("mail") is want
+    assert tiers.allow_send("mail") is want
 
 
 def test_allow_send_unset_is_false(monkeypatch):
     monkeypatch.delenv("MACOS_APPS_READ_ONLY", raising=False)
     monkeypatch.delenv("MACOS_APPS_ALLOW_SEND", raising=False)
-    assert srv._allow_send("mail") is False
+    assert tiers.allow_send("mail") is False
 
 
 def test_read_only_beats_allow_send(monkeypatch):
     # READ_ONLY is the safe-deploy guard — a send tier cannot punch through it.
     monkeypatch.setenv("MACOS_APPS_READ_ONLY", "1")
     monkeypatch.setenv("MACOS_APPS_ALLOW_SEND", "all")
-    assert srv._allow_send("mail") is False
+    assert tiers.allow_send("mail") is False
 
 
 def test_allow_send_is_per_adapter(monkeypatch):
     monkeypatch.delenv("MACOS_APPS_READ_ONLY", raising=False)
     monkeypatch.setenv("MACOS_APPS_ALLOW_SEND", "mail")
-    assert srv._allow_send("mail") is True
-    assert srv._allow_send("messages") is False
+    assert tiers.allow_send("mail") is True
+    assert tiers.allow_send("messages") is False
 
 
 def test_send_annotations_are_destructive_and_open_world():
@@ -687,9 +729,36 @@ def test_delete_note_dispatches(monkeypatch):
 
     fake = _FakeNotes()
     monkeypatch.setattr(srv, "_notes", fake)
-    out = srv.delete_note("N-1", expect_title="Milk")
+    # GATE-05 (D-01): dry_run now defaults True — pass False to expect a real delete.
+    out = srv.delete_note("N-1", expect_title="Milk", dry_run=False)
     assert fake.calls == [("N-1", "Milk")]
     assert out == {"deleted": "N-1"}
+
+
+def test_delete_note_bare_call_previews(monkeypatch):
+    calls = []
+
+    class _Notes:
+        def delete(self, ident, expect_title=None, dry_run=False):
+            calls.append((ident, expect_title, dry_run))
+            return {"dry_run": True, "would_delete": {}}
+
+    monkeypatch.setattr(srv, "_notes", _Notes())
+    srv.delete_note("N-1")
+    assert calls == [("N-1", None, True)]
+
+
+def test_delete_draft_bare_call_previews(monkeypatch):
+    calls = []
+
+    class _Mail:
+        def delete_draft(self, ident, dry_run=False):
+            calls.append((ident, dry_run))
+            return {"dry_run": True, "would_delete": {}}
+
+    monkeypatch.setattr(srv, "_mail", _Mail())
+    srv.delete_draft("a@b")
+    assert calls == [("a@b", True)]
 
 
 def test_create_note_tool_dispatches(monkeypatch):
@@ -701,11 +770,27 @@ def test_create_note_tool_dispatches(monkeypatch):
 
 
 def test_update_note_tool_dispatches(monkeypatch):
+    # GATE-05 (D-02): dry_run now defaults True — pass False to expect the real update.
+    fake = _FakeSource()
+    monkeypatch.setattr(srv, "_notes", fake)
+    out = srv.update_note("x-coredata://S/ICNote/p1", "New", "Body", dry_run=False)
+    assert fake.queries == [("update", "x-coredata://S/ICNote/p1", "New", "Body")]
+    assert out == {"id": "x-coredata://S/ICNote/p1", "summary": "New", "deeplink": ""}
+
+
+def test_update_note_bare_call_previews(monkeypatch):
     fake = _FakeSource()
     monkeypatch.setattr(srv, "_notes", fake)
     out = srv.update_note("x-coredata://S/ICNote/p1", "New", "Body")
     assert fake.queries == [("update", "x-coredata://S/ICNote/p1", "New", "Body")]
-    assert out == {"id": "x-coredata://S/ICNote/p1", "summary": "New", "deeplink": ""}
+    assert out == {
+        "dry_run": True,
+        "would_update": {
+            "id": "x-coredata://S/ICNote/p1",
+            "current": {"title": "Old", "body_chars": 3},
+            "new": {"title": "New", "body_chars": 4},
+        },
+    }
 
 
 # --- errors-as-results: the dispatch seam converts typed native failures (#47) --------
@@ -743,6 +828,7 @@ def test_read_tool_empty_result_is_not_an_error(monkeypatch):
     assert srv.notes("nonexistent") == []
 
 
+@_write_gate_on_only
 def test_write_tool_converts_native_error_to_agent_directive(monkeypatch):
     class _DeadWriter:
         def create_reminder(self, data: ReminderData) -> Pointer:
@@ -801,6 +887,7 @@ def test_guard_converts_value_error_to_agent_directive(monkeypatch):
         srv.contacts("jane")
 
 
+@_write_gate_on_only
 def test_optional_datetime_parse_error_names_the_field(monkeypatch):
     # An optional datetime param that fails to parse is labeled with the failing
     # field, exactly like the required ones.
@@ -817,7 +904,15 @@ def test_optional_datetime_parse_error_names_the_field(monkeypatch):
 def test_no_notice_exempts_exactly_the_meta_tools():
     # usage carries only tool-call counts — no user-store content — so it is exempt.
     # audit is deliberately NOT exempt: entries embed (truncated) user-store args.
-    assert {"ping", "now", "doctor", "usage"} == srv._NO_NOTICE
+    assert {"ping", "now", "doctor", "usage"} == registry.no_notice()
+
+
+def test_hand_maintained_notice_sets_are_gone():
+    # GATE-04: the notice exemption and the #163 backup advisory are decided from
+    # registry.TOOLS per call now — notices.py no longer carries its own parallel
+    # hand-maintained sets that could drift from the registration record.
+    assert not hasattr(notices, "NO_NOTICE_TOOLS")
+    assert not hasattr(notices, "_BACKUP_NOTICE_TOOLS")
 
 
 def test_untrusted_notice_covers_every_registered_tool_except_meta():
@@ -828,7 +923,7 @@ def test_untrusted_notice_covers_every_registered_tool_except_meta():
     async def _run():
         async with Client(srv.mcp) as c:
             names = [t.name for t in await c.list_tools()]
-        mw = srv.UntrustedDataNotice()
+        mw = notices.UntrustedDataNotice()
         out = {}
         for name in names:
             ctx = SimpleNamespace(message=SimpleNamespace(name=name))
@@ -841,13 +936,52 @@ def test_untrusted_notice_covers_every_registered_tool_except_meta():
 
     names, out = asyncio.run(_run())
     assert names, "no tools registered"
-    assert set(names) >= srv._NO_NOTICE  # the exempt tools really exist
+    assert set(names) >= registry.no_notice()  # the exempt tools really exist
     for name in names:
         first = out[name][0].text
-        if name in srv._NO_NOTICE:
+        if name in registry.no_notice():
             assert first == "payload", f"{name} must be exempt from the notice"
         else:
-            assert first == srv.UNTRUSTED_NOTICE, f"{name} is missing the notice"
+            assert first == notices.UNTRUSTED_NOTICE, f"{name} is missing the notice"
+
+
+def test_unregistered_tool_name_gets_the_notice_fail_safe():
+    # GATE-04 (T-1-34): a tool name absent from registry.TOOLS is not a meta tool by
+    # construction — the notice rides on it too, so a lookup that can't find a record
+    # never silently drops the prompt-injection mitigation.
+    mw = notices.UntrustedDataNotice()
+
+    async def call_next(_ctx):
+        return ToolResult(content=[TextContent(type="text", text="payload")])
+
+    async def _run():
+        ctx = SimpleNamespace(message=SimpleNamespace(name="totally_unregistered_tool"))
+        return (await mw.on_call_tool(ctx, call_next)).content
+
+    content = asyncio.run(_run())
+    assert content[0].text == notices.UNTRUSTED_NOTICE
+
+
+def test_backup_advisory_rides_the_three_recoverable_writes(monkeypatch):
+    # #163: move_mail/trash_mail/mail_undo carry backup_notice=True on their registry
+    # record, so the middleware appends mail_recover.backup_advisory() right after the
+    # untrusted-data notice when it returns text.
+    from macos_apps_mcp.adapters import mail_recover
+
+    monkeypatch.setattr(mail_recover, "backup_advisory", lambda: "ADVISORY-TEXT")
+    mw = notices.UntrustedDataNotice()
+
+    async def call_next(_ctx):
+        return ToolResult(content=[TextContent(type="text", text="payload")])
+
+    async def _run(name):
+        ctx = SimpleNamespace(message=SimpleNamespace(name=name))
+        return (await mw.on_call_tool(ctx, call_next)).content
+
+    for name in ("move_mail", "trash_mail", "mail_undo"):
+        content = asyncio.run(_run(name))
+        assert content[0].text == notices.UNTRUSTED_NOTICE
+        assert content[1].text == "ADVISORY-TEXT", f"{name} missing the advisory"
 
 
 def test_untrusted_notice_end_to_end_and_leaves_data_intact(monkeypatch):
@@ -862,9 +996,9 @@ def test_untrusted_notice_end_to_end_and_leaves_data_intact(monkeypatch):
             )
 
     reminders_res, now_res = asyncio.run(_run())
-    assert reminders_res.content[0].text == srv.UNTRUSTED_NOTICE
+    assert reminders_res.content[0].text == notices.UNTRUSTED_NOTICE
     assert reminders_res.data == [{"id": "P-1", "summary": "s", "deeplink": "d"}]
-    assert now_res.content[0].text != srv.UNTRUSTED_NOTICE  # meta tool exempt
+    assert now_res.content[0].text != notices.UNTRUSTED_NOTICE  # meta tool exempt
 
 
 def test_untrusted_notice_is_one_block_not_per_item(monkeypatch):
@@ -880,10 +1014,10 @@ def test_untrusted_notice_is_one_block_not_per_item(monkeypatch):
             return await c.call_tool("reminders", {"due": "today"})
 
     res = asyncio.run(_run())
-    notices = [
-        b for b in res.content if getattr(b, "text", None) == srv.UNTRUSTED_NOTICE
+    notice_blocks = [
+        b for b in res.content if getattr(b, "text", None) == notices.UNTRUSTED_NOTICE
     ]
-    assert len(notices) == 1 and res.content[0].text == srv.UNTRUSTED_NOTICE
+    assert len(notice_blocks) == 1 and res.content[0].text == notices.UNTRUSTED_NOTICE
 
 
 def test_untrusted_notice_not_added_to_error_results(monkeypatch):
@@ -901,7 +1035,7 @@ def test_untrusted_notice_not_added_to_error_results(monkeypatch):
                 await c.call_tool("reminders", {"due": "today"})
             return str(exc.value)
 
-    assert srv.UNTRUSTED_NOTICE not in asyncio.run(_run())
+    assert notices.UNTRUSTED_NOTICE not in asyncio.run(_run())
 
 
 # --- dry_run dispatch (#54) ----------------------------------------------------------
@@ -931,8 +1065,9 @@ def test_delete_event_dry_run_dispatches_and_passes_envelope_through(monkeypatch
     assert out == envelope
 
 
-def test_delete_event_without_dry_run_still_mutates_and_reports_deleted(monkeypatch):
-    # guard the default path: no dry_run -> the mutating adapter call, {"deleted": id}.
+def test_delete_event_explicit_dry_run_false_mutates_and_reports_deleted(monkeypatch):
+    # GATE-05 (D-01): the bare call now previews (see test_delete_event_bare_call_
+    # previews) — guard the EXPLICIT dry_run=False path, the only one that mutates.
     calls = []
 
     class _Cal:
@@ -941,7 +1076,7 @@ def test_delete_event_without_dry_run_still_mutates_and_reports_deleted(monkeypa
             return {"deleted": ident}
 
     monkeypatch.setattr(srv, "_calendar", _Cal())
-    assert srv.delete_event("E-1") == {"deleted": "E-1"}
+    assert srv.delete_event("E-1", dry_run=False) == {"deleted": "E-1"}
     assert calls == [("E-1", None, False)]
 
 

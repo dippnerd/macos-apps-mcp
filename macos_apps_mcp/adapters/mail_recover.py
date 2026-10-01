@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import count
@@ -151,9 +152,9 @@ def check_batch(targets) -> list[Target]:
     if len(items) > MAX_TARGETS:
         raise BatchTooLarge(
             f"this operation would affect {len(items)} messages but the safety cap is "
-            f"{MAX_TARGETS}, and it is not overridable — every target is backed up to "
-            "disk before anything moves. Split the batch and re-issue. Do not retry "
-            "the same oversized batch unchanged."
+            f"{MAX_TARGETS}, and it is not overridable — it bounds how much one call "
+            "can touch. Split the batch and re-issue. Do not retry the same oversized "
+            "batch unchanged."
         )
     return items
 
@@ -329,7 +330,19 @@ def _check_op(op: str) -> str:
     return op
 
 
-def preview(op: str, targets, *, destination: str | None = None) -> dict:
+# A dry-run presence read: given the batch, answer each target's id with what a READ
+# of stored messages found (AppleScript, not sqlite — the index lags Mail, #146). Owned
+# by ``preview``/``recoverable`` now (GATE-09), not re-derived per caller.
+Present = Callable[[list["Target"]], dict[str, str]]
+
+
+def preview(
+    op: str,
+    targets,
+    *,
+    destination: str | None = None,
+    present: Present | None = None,
+) -> dict:
     """The ONE dry-run envelope every destructive mail write answers with.
 
     Shaped like ``deletion_result``/``read_result``: a single wire shape, so "what does
@@ -337,14 +350,18 @@ def preview(op: str, targets, *, destination: str | None = None) -> dict:
     behaviours that drift. It reports what WOULD be touched and where each target
     currently is — no backup written, no Apple Event sent, nothing on disk.
 
-    The caller is expected to have refreshed ``status`` through a READ of stored
-    messages first (AppleScript, not sqlite: the index lags, and a preview claiming 25
-    ids are present when they are not is worse than no preview). Reading stored
-    messages strands nothing — the same justification #129's reply-all preview stands
-    on.
+    ``present``, when given, is run over the batch ONCE and each target's ``status`` is
+    stamped from its answer (``"missing"`` for an id the read did not answer for) — a
+    READ of stored messages, same justification #129's reply-all preview stands on, and
+    it strands nothing. Omit it (the default) only when there truly is no read for this
+    op: the target's incoming ``status`` (``"planned"`` by construction) is reported
+    as-is, and that is a visible choice made at the call site, never a silent gap.
     """
     _check_op(op)
     items = check_batch(targets)
+    if present is not None:
+        answered = present(items)
+        items = [replace(t, status=answered.get(t.id, "missing")) for t in items]
     out: dict = {
         "dry_run": True,
         "op": op,
@@ -367,11 +384,14 @@ def recoverable(
     targets,
     act,
     *,
+    dry_run: bool = False,
+    present: Present | None = None,
     destination: str | None = None,
     backup: bool = True,
     allow_lossy: bool = False,
 ) -> dict:
-    """**backup → log → act**, then report what actually happened.
+    """**backup → log → act**, then report what actually happened — or, on
+    ``dry_run=True``, run the plane's own preflight and return a preview instead.
 
     ``act(targets) -> dict[id, status]`` is the caller's AppleScript, and its returned
     status per id is taken as the truth of record — callers are expected to VERIFY
@@ -379,6 +399,17 @@ def recoverable(
     returns cleanly having done nothing is this project's most expensive recurring bug.
     An id missing from that map is recorded as ``unknown``, which is honest; defaulting
     it to ``ok`` would be the reassuring-direction lie.
+
+    ``dry_run=True`` runs ``present`` over the batch and returns ``preview()``'s
+    envelope; ``act``, ``_backup`` and ``audit_write`` are never reached. ``present`` is
+    now REQUIRED on a dry run — GATE-09 closed the bug where a caller-owned dry run
+    (``dedupe_batch``) skipped its own read and previewed "planned" for targets nobody
+    had checked. There is no opt-out: Python cannot tell an omitted keyword from an
+    explicit ``present=None``, so a missing ``present`` always raises ``TypeError``
+    naming the op, never silently falls back to an unread preview. An op with genuinely
+    no read for this batch calls ``preview()`` directly instead of going through
+    ``recoverable()`` — that is the one place ``present=None`` is a legitimate,
+    visible-at-the-call-site choice (see ``preview``'s docstring).
 
     ``destination`` is what undo needs to move a batch back FROM. Without it a receipt
     is not replayable, and says so.
@@ -394,6 +425,15 @@ def recoverable(
     """
     _check_op(op)
     items = check_batch(targets)
+    if dry_run:
+        if present is None:
+            raise TypeError(
+                f"recoverable({op!r}, dry_run=True) needs `present` — a dry run reads "
+                "presence itself now; it cannot report a target as planned or present "
+                "when nobody checked. There is no opt-out here: call `preview()` "
+                "directly (with `present=None`) if this op truly has no read."
+            )
+        return preview(op, items, destination=destination, present=present)
     # Locating exists to serve exactly two consumers — the file backup, and the lossy
     # gate on a PERMANENT op. With neither in play it is pure cost, and not a small one:
     # `_rowid_paths` rglobs a 36k-file tree (~2s) per call, and the dedupe CLI (#140)

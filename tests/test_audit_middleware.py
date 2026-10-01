@@ -1,8 +1,10 @@
 """Unit tests for AuditMiddleware — envelope + before-state, failure isolation.
 
-The middleware accepts its write-tool set and snapshot sources at construction
-(the Snapshotter seam, contracts.py) — so these tests build one with fakes instead
-of patching server globals.
+The middleware accepts its audit-verb map and snapshot sources at construction (the
+Snapshotter seam, contracts.py) — so these tests build one with fakes instead of
+patching server globals. GATE-06: a write is a KEY of ``audit_verbs`` — the map IS
+the write-tool set, and the verb rides with it — so a write cannot be tracked
+without a verb (no ``_audit_op`` fallback).
 """
 
 from __future__ import annotations
@@ -13,12 +15,13 @@ from types import SimpleNamespace
 import macos_apps_mcp.audit as au
 from macos_apps_mcp.contracts import Pointer, Snapshotter
 
-_WRITES = {"create_event", "update_event"}
+_AUDIT_VERBS = {"create_event": "create", "update_event": "update"}
 
 
-def _mw(snapshot_sources=None):
+def _mw(snapshot_sources=None, audit_verbs=None):
     return au.AuditMiddleware(
-        write_tools=_WRITES, snapshot_sources=snapshot_sources or {}
+        audit_verbs=_AUDIT_VERBS if audit_verbs is None else audit_verbs,
+        snapshot_sources=snapshot_sources or {},
     )
 
 
@@ -44,6 +47,17 @@ def _capture(monkeypatch):
     monkeypatch.setattr(au, "audit_write", records.append)
     monkeypatch.setattr(au, "usage_log", lambda tool: None)  # keep tests hermetic
     return records
+
+
+def test_op_comes_from_the_verb_map(monkeypatch):
+    # GATE-06: the verb is a per-tool FACT stated once at registration and read back
+    # from the map — not re-derived from the tool name at audit time.
+    records = _capture(monkeypatch)
+    mw = _mw(audit_verbs={"t": "move"})
+    _run(mw, _ctx("t", {}), _Result({"id": "X-1"}))
+    assert records[0]["op"] == "move"
+    _run(mw, _ctx("untracked", {}), _Result({"id": "X-2"}))
+    assert len(records) == 1  # a tool not in the map is never logged
 
 
 def test_create_logs_envelope_no_before(monkeypatch):
@@ -149,8 +163,13 @@ def test_audit_write_failure_never_propagates(monkeypatch):
 def test_server_snapshot_sources_are_derived_and_satisfy_the_protocol():
     # #67 deepening: the tool→adapter map is DERIVED at registration
     # (@_write_tool(snapshot=…)), and every registered source satisfies the declared
-    # Snapshotter Protocol — no duck-typed method, no hand-maintained dict.
-    import macos_apps_mcp.server as srv
+    # Snapshotter Protocol — no duck-typed method, no hand-maintained dict. GATE-04:
+    # the registry (not a hand-maintained server.py set) is the one record now.
+    # Read registry.TOOLS directly (every record, registered or not, GATE-07/D-01) —
+    # registry.snapshot_sources()/write_tools() filter to r.registered, empty under
+    # MACOS_APPS_READ_ONLY=1. This is a fact about a write tool (every record,
+    # registered or not), not about what's live in this process.
+    import macos_apps_mcp.registry as registry
 
     expected = {
         "update_event",
@@ -161,8 +180,12 @@ def test_server_snapshot_sources_are_derived_and_satisfy_the_protocol():
         "delete_note",
         "delete_draft",
     }
-    assert set(srv._SNAPSHOT_SOURCES) == expected
-    for source in srv._SNAPSHOT_SOURCES.values():
+    snapshot_sources = {
+        n: r.snapshot for n, r in registry.TOOLS.items() if r.snapshot is not None
+    }
+    assert set(snapshot_sources) == expected
+    for source in snapshot_sources.values():
         assert isinstance(source, Snapshotter)
-    # every snapshot-capable tool is also a registered write tool
-    assert set(srv._SNAPSHOT_SOURCES) <= srv._WRITE_TOOLS
+    all_writes = {n for n, r in registry.TOOLS.items() if r.is_write}
+    # every snapshot-capable tool is also a write tool (every record, registered or not)
+    assert set(snapshot_sources) <= all_writes

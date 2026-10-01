@@ -30,7 +30,7 @@ by default, its own audit verb, and verification by running it on device and ins
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Gate — Land the Spiked Architecture Cuts** - Native seam fail-closed, module boundaries settled, one registration record, Mail's fixture and recoverable preflight fixed
+- [x] **Phase 1: Gate — Land the Spiked Architecture Cuts** - Native seam fail-closed, module boundaries settled, one registration record, Mail's fixture and recoverable preflight fixed (completed 2026-09-26)
 - [ ] **Phase 2: Gate Close — Fail-Closed Suite and Device Sweep** - The read-only suite goes green, doctor stops touching the dev machine, the device integration sweep passes
 - [ ] **Phase 02.1: Mail Fixes — Batch Moves Fit Their Timeout, Drafts Pick Their Account** (INSERTED) - A full 25-message move or trash finishes and always leaves a receipt; a draft starts from the account the caller names
 - [ ] **Phase 3: EventKit Depth — Calendar Alarms & Recurrence, Reminders CRUD & Subtasks** - The shared EventKit plane reaches Mail-level completeness
@@ -54,55 +54,55 @@ Decimal phases appear between their surrounding integers in numeric order.
   5. Mail's plane holds under the new seam: `query_*` executors run through the shared `tests/envelope.py` fixture (schema carrying `m.size`, `message_references` and every other column read, `HEADER_FINGERPRINT` covering them; the fixture carries both the native shape and the Sequoia shape — `sequoiaify_envelope` plus the #201 sidecar), `recoverable(...)` runs its own preflight so `dedupe_batch(dry_run=True)` cannot report "planned" for unchecked targets and a dry run without a stated `present` is an error, the script-timeout tripwire passes with `_DEDUPE` fixed — verified on a scratch mailbox with the watchdog running, dry-run envelopes and osascript argv byte-identical to `develop` before the cut (not 0.10.1: #201 changed `mail.py` after the tag).
   6. The cuts land 1 → 7 → 5 → 2 by rebasing each onto the previous PR (Mail-scoped 3/4/9 in parallel); after cards 5 and 2 a rebuilt, restarted daemon answers `doctor().version` with the new version and one outbound dry run still reports gated correctly; `spike/arch-review-*` branches and `.claude/worktrees/` are deleted. The first card rebases onto current `develop`: the spikes are 16 commits behind, and the #199/#201 Sequoia plane changed `doctor.py`, `server.py`, `runtime.py`, `contracts.py`, `mail.py`, `mail_index.py` and `tests/conftest.py` — every card touches at least one of them.
 
-**Plans**: 14 plans in 11 waves
+**Plans**: 14/14 plans executed in 11 waves
 
 Plans:
 **Wave 1**
 
-- [ ] 01-01-PLAN.md — Pre-gate release v0.11.0: bump PR, owner-gated cut + tag, notarized build, daemon install, doctor proof (D-05)
+- [x] 01-01-PLAN.md — Pre-gate release v0.11.0: bump PR, owner-gated cut + tag, notarized build, daemon install, doctor proof (D-05)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 01-02-PLAN.md — Card 1a: conftest locks run_osascript/body_file/tracked_run at runtime; shortcuts qualified; doctor tests off live pgrep
-- [ ] 01-03-PLAN.md — Card 9: backstop ≥ host-cap tripwire over every osascript call site; `_DEDUPE` backstop 900 s; landed
+- [x] 01-02-PLAN.md — Card 1a: conftest locks run_osascript/body_file/tracked_run at runtime; shortcuts qualified; doctor tests off live pgrep
+- [x] 01-03-PLAN.md — Card 9: backstop ≥ host-cap tripwire over every osascript call site; `_DEDUPE` backstop 900 s; landed
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 01-04-PLAN.md — Card 1b: every adapter + doctor reach the seam qualified; tripwire widened to adapters/*.py + doctor.py; card 1 landed
-- [ ] 01-05-PLAN.md — Card 4: `recoverable()` owns the dry-run read; v0.11.0 byte-identity baseline; check_batch text; PR open
+- [x] 01-04-PLAN.md — Card 1b: every adapter + doctor reach the seam qualified; tripwire widened to adapters/*.py + doctor.py; card 1 landed
+- [x] 01-05-PLAN.md — Card 4: `recoverable()` owns the dry-run read; v0.11.0 byte-identity baseline; check_batch text; PR open
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 01-06-PLAN.md — Card 7: EventKit cluster to `eventkit.py`; runtime = 11-name native door; landed
-- [ ] 01-07-PLAN.md — Card 3: shared `tests/envelope.py` fixture in both shapes; HEADER_FINGERPRINT coverage test; landed
+- [x] 01-06-PLAN.md — Card 7: EventKit cluster to `eventkit.py`; runtime = 11-name native door; landed
+- [x] 01-07-PLAN.md — Card 3: shared `tests/envelope.py` fixture in both shapes; HEADER_FINGERPRINT coverage test; landed
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 01-08-PLAN.md — Device session: card 7 EventKit proof; card 4 scratch-mailbox verification with the watchdog; card 4 merged
+- [x] 01-08-PLAN.md — Device session: card 7 EventKit proof; card 4 scratch-mailbox verification with the watchdog; card 4 merged
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 01-09-PLAN.md — Card 5: `tiers.py` + `notices.py`; doctor's server reach-in removed; layering test; landed
+- [x] 01-09-PLAN.md — Card 5: `tiers.py` + `notices.py`; doctor's server reach-in removed; layering test; landed
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 01-10-PLAN.md — Dev-build daemon check after card 5 (D-06)
+- [x] 01-10-PLAN.md — Dev-build daemon check after card 5 (D-06)
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
-- [ ] 01-11-PLAN.md — Card 2a: one `_tool` registration record; audit verbs from the record; `_audit_op` removed
+- [x] 01-11-PLAN.md — Card 2a: one `_tool` registration record; audit verbs from the record; `_audit_op` removed
 
 **Wave 9** *(blocked on Wave 8 completion)*
 
-- [ ] 01-12-PLAN.md — Card 2b: adapter/permission/notice facts on the record; registry becomes the one outbound ledger
+- [x] 01-12-PLAN.md — Card 2b: adapter/permission/notice facts on the record; registry becomes the one outbound ledger
 
 **Wave 10** *(blocked on Wave 9 completion)*
 
-- [ ] 01-13-PLAN.md — Card 2c: D-01/D-02 dry-run defaults, D-04 fail-closed registry test, CHANGELOG; card 2 landed
+- [x] 01-13-PLAN.md — Card 2c: D-01/D-02 dry-run defaults, D-04 fail-closed registry test, CHANGELOG; card 2 landed
 
 **Wave 11** *(blocked on Wave 10 completion)*
 
-- [ ] 01-14-PLAN.md — Dev-build daemon check after card 2; landing order recorded; spike branches and worktrees deleted (D-09)
+- [x] 01-14-PLAN.md — Dev-build daemon check after card 2; landing order recorded; spike branches and worktrees deleted (D-09)
 
 ### Phase 2: Gate Close — Fail-Closed Suite and Device Sweep
 
@@ -115,7 +115,26 @@ Plans:
   2. `uv run pytest` runs no live `pgrep`/`ps` against the dev machine: doctor's 17 process-probe tests go through the locked `tracked_run` seam.
   3. `uv run pytest -m integration` is green on the current macOS against a daemon rebuilt and reinstalled from the gate, and `uv run ruff check .` plus `uv run ruff format --check .` pass.
 
-**Plans**: TBD
+**Plans**: 5/6 plans executed in 4 waves
+
+Plans:
+**Wave 1**
+
+- [x] 02-01-PLAN.md — GATE-07: fact tests read `registry.TOOLS`, call tests skip read-only by one marker, CI read-only step (D-01, D-02)
+- [x] 02-02-PLAN.md — GATE-11: `doctor._process_name` through `tracked_run`, AST tripwire, Popen-spy proof at 0
+- [x] 02-03-PLAN.md — D-04: integration Mail writes use 2 marker mails only; `inbox_messages` fails loud
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 02-04-PLAN.md — Device prep: dev-build daemon from `develop`, watchdog check, seed the 2 marker mails (D-03, D-04)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 02-05-PLAN.md — GATE-12: full device sweep, findings (fix / issue + strict xfail / record), final green run (D-05..D-08)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 02-06-PLAN.md — v0.12.0 release, owner-approved one-way cut, `doctor()` proof (D-09)
 
 ### Phase 02.1: Mail Fixes — Batch Moves Fit Their Timeout, Drafts Pick Their Account (INSERTED)
 
@@ -201,8 +220,8 @@ Phases execute in numeric order: 1 → 2 → 02.1 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Gate — Land the Spiked Architecture Cuts | 0/14 | Planned | - |
-| 2. Gate Close — Fail-Closed Suite and Device Sweep | 0/TBD | Not started | - |
+| 1. Gate — Land the Spiked Architecture Cuts | 14/14 | Complete    | 2026-09-26 |
+| 2. Gate Close — Fail-Closed Suite and Device Sweep | 5/6 | In Progress|  |
 | 02.1. Mail Fixes (INSERTED) | 0/TBD | Not started | - |
 | 3. EventKit Depth — Calendar & Reminders | 0/TBD | Not started | - |
 | 4. Notes & Photos | 0/TBD | Not started | - |

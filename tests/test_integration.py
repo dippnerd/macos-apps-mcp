@@ -16,7 +16,8 @@ import time
 import EventKit as EK
 import pytest
 
-from macos_apps_mcp.runtime import request_access, run_native, store
+from macos_apps_mcp.eventkit import request_access, store
+from macos_apps_mcp.runtime import run_native
 
 # Every test in this module touches real EventKit/TCC — mark them all at module level
 # so a forgotten per-test decorator can never leak a live test into CI.
@@ -241,7 +242,7 @@ def test_recurring_event_update_targets_one_occurrence(created):
 
     from macos_apps_mcp.adapters.calendar import CalendarAdapter
     from macos_apps_mcp.contracts import CalendarEventData
-    from macos_apps_mcp.runtime import to_nsdate
+    from macos_apps_mcp.eventkit import to_nsdate
 
     run_native(request_access)
     a = CalendarAdapter()
@@ -314,7 +315,7 @@ def test_recurring_update_omitted_span_raises_and_does_not_write(created):
     from macos_apps_mcp.adapters.calendar import CalendarAdapter
     from macos_apps_mcp.contracts import CalendarEventData
     from macos_apps_mcp.errors import SpanRequired
-    from macos_apps_mcp.runtime import to_nsdate
+    from macos_apps_mcp.eventkit import to_nsdate
 
     run_native(request_access)
     a = CalendarAdapter()
@@ -375,7 +376,7 @@ def test_recurring_update_future_events_propagates(created):
 
     from macos_apps_mcp.adapters.calendar import CalendarAdapter
     from macos_apps_mcp.contracts import CalendarEventData
-    from macos_apps_mcp.runtime import to_nsdate
+    from macos_apps_mcp.eventkit import to_nsdate
 
     run_native(request_access)
     a = CalendarAdapter()
@@ -831,7 +832,9 @@ def test_update_note_preserves_id():
     updated = adapter.update(
         created.id, NoteData(title="mac-mcp itest upd", body="after")
     )
-    assert updated.id == created.id  # id survives a body edit
+    # update() returns a plain dict (Pointer(...).as_dict()), not a Pointer — the
+    # same envelope shape its dry_run=True preview uses (GATE-05/D-02 uniformity).
+    assert updated["id"] == created.id  # id survives a body edit
     bodies = adapter.get_bodies([created.id])
     assert "after" in bodies[0]["body"] and "before" not in bodies[0]["body"]
     adapter.delete(created.id)
@@ -1150,8 +1153,13 @@ def test_notes_sqlite_is_subset_of_applescript_real_store():
 
     adapter = notes_mod.NotesAdapter()
     sqlite_ids = {p.id for p in adapter.get_all()}  # sqlite path (FDA granted)
+    # notes.py imports the native seam qualified (`from .. import runtime`,
+    # Phase 1 gate card 1) — there is no module-level run_osascript to call.
     applescript_ids = {
-        p.id for p in notes_mod._parse_all(notes_mod.run_osascript(notes_mod._LIST_ALL))
+        p.id
+        for p in notes_mod._parse_all(
+            notes_mod.runtime.run_osascript(notes_mod._LIST_ALL)
+        )
     }
     if not applescript_ids:
         pytest.skip("no notes in this Mac's library")
@@ -1159,7 +1167,9 @@ def test_notes_sqlite_is_subset_of_applescript_real_store():
     # ids AppleScript currently holds in Recently Deleted — a note mid-delete that
     # sqlite hasn't caught up on lives here, and is NOT a leak.
     recently_deleted = {
-        i for i in notes_mod.run_osascript(_RECENTLY_DELETED_IDS).splitlines() if i
+        i
+        for i in notes_mod.runtime.run_osascript(_RECENTLY_DELETED_IDS).splitlines()
+        if i
     }
     phantom = sqlite_ids - applescript_ids - recently_deleted
     assert not phantom, (  # in neither live nor trash = wrong id or genuine leak
@@ -1347,6 +1357,12 @@ def test_list_attachments_finds_draft_attachment(created):
         )
 
 
+@pytest.mark.xfail(
+    strict=False,
+    reason="#230 — intermittent: quoted_body() content read exceeds the 30 s cap "
+    "on some inbox messages (4 of 5 device runs failed, Mail not wedged); "
+    "strict=False because it also passes — Phase 02.1 investigates",
+)
 def test_mail_reply_opens_threaded_draft_and_never_sends():
     """#42/#46: reply to a real inbox message → a draft exists UNSENT (outgoing
     message) with our body; delete it; confirm nothing sent. Threading headers can
@@ -1488,28 +1504,83 @@ def _mail_adapter():
     return MailAdapter()
 
 
+# --- D-04: the Mail write tests act on 2 marker mails only, never real mail --------
+# The marker text avoids the word "integration" on purpose: mail_search's subject
+# filter is a substring match (LIKE %subject%), and tests/integration/test_mail_
+# outbound.py sends "macos-apps-mcp integration …" mails to the same address. A
+# shared substring would let those send-test mails count as markers here.
+MARKER_SUBJECT = "macos-apps-mcp sweep marker"
+
+# The one-time seed command (D-04). Run once from the repo root with the Mail
+# watchdog loaded (`launchctl list | grep ren.lav.mail-watchdog`). The address is
+# the operator's own (D-05) — never change it to a third party.
+SEED_MARKERS = (
+    'uv run python -c "from macos_apps_mcp.adapters.mail import MailAdapter as M; '
+    "[M().send('andrei@lav.ren', 'macos-apps-mcp sweep marker', "
+    "'Marker mail for the integration sweep (D-04). Leave it in the INBOX.', "
+    'dry_run=False) for _ in range(2)]"'
+)
+
+
+def _pick_account(
+    non_gmail: list[str], fallback: str, marker_folders: list[str]
+) -> str:
+    """Pure: among `non_gmail` account ids, prefer whichever one's INBOX holds a
+    MARKER_SUBJECT hit (most hits wins); `fallback` when none does."""
+    marker_accounts = [
+        f.split("://", 1)[1].split("/", 1)[0]
+        for f in marker_folders
+        if f.endswith("/INBOX")
+    ]
+    candidates = [a for a in marker_accounts if a in non_gmail]
+    return max(set(candidates), key=candidates.count) if candidates else fallback
+
+
+def _scratch_account(m) -> str:
+    """The account id both `scratch_mailbox` and `inbox_messages` operate on
+    (RESEARCH Pitfall 2) — one helper, so a "same-account" move test cannot
+    silently cross accounts.
+
+    Markers define the account (owner decision, 2026-09-29): the seed sends to
+    andrei@lav.ren, and that address lands in whichever account receives it on
+    this Mac — not necessarily the first non-Gmail account by sorted id. Prefer
+    whichever IMAP non-Gmail account's INBOX holds a MARKER_SUBJECT hit. When no
+    INBOX holds a marker, fall back to the first non-Gmail account by sorted id,
+    deterministically — overview() sorts unread-first, so "first account" changed
+    day to day, and a Gmail account's move/undo verifications are structurally
+    unreliable: a Gmail "move" is a label edit the server reconciles at its own
+    pace, and label copies were observed RESURRECTING after both a verified
+    trash and a verified unlabel (2026-08-20, -23). True IMAP accounts verify
+    moves synchronously (§5b), so pick one when the markers don't decide it.
+    """
+    rows = m.overview()
+    imap_rows = [r for r in rows if r["folder"].startswith("imap://")]
+    if not imap_rows:
+        pytest.skip("no IMAP account in Mail on this Mac")
+    gmail_accounts = {
+        r["account_id"] for r in imap_rows if "%5BGmail%5D" in r["folder"]
+    }
+    account_ids = sorted({r["account_id"] for r in imap_rows})
+    non_gmail = [a for a in account_ids if a not in gmail_accounts]
+    fallback = next(iter(non_gmail), account_ids[0])
+    marker_folders = [
+        h["folder"] for h in m.search(subject=MARKER_SUBJECT, limit=5)["results"]
+    ]
+    return _pick_account(non_gmail, fallback, marker_folders)
+
+
 @pytest.fixture
 def scratch_mailbox():
-    """A mailbox to move test mail into. Created on the FIRST account mail_overview
-    reports, so this is not wired to one developer's account list.
+    """A mailbox to move test mail into, on the account `_scratch_account` picks
+    (the account the marker mails landed in; sorted non-Gmail fallback when
+    none did — see its docstring).
 
     NOT removed in teardown: `delete <mailbox>` is not scriptable (-10000 in every form,
     device-verified 2026-08-03), so a scratch mailbox is a permanent artefact of running
     this test. It is created once and reused — the name is stable on purpose.
     """
     m = _mail_adapter()
-    rows = [r for r in m.overview() if r["folder"].startswith("imap://")]
-    if not rows:
-        pytest.skip("no IMAP account in Mail on this Mac")
-    # Prefer a NON-Gmail account, deterministically. overview() sorts unread-first,
-    # so "first account" changed day to day — and on a Gmail account the move/undo
-    # verifications are structurally unreliable: a Gmail "move" is a label edit the
-    # server reconciles at its own pace, and label copies were observed RESURRECTING
-    # after both a verified trash and a verified unlabel (2026-08-20, -23). True
-    # IMAP accounts verify moves synchronously (§5b), so pick one when it exists.
-    gmail_accounts = {r["account_id"] for r in rows if "%5BGmail%5D" in r["folder"]}
-    account_ids = sorted({r["account_id"] for r in rows})
-    account = next((a for a in account_ids if a not in gmail_accounts), account_ids[0])
+    account = _scratch_account(m)
     name = "macos-apps-mcp-test"
     folder = f"imap://{account}/{name}"
     # already there from an earlier run is the NORMAL case — the stable name is the
@@ -1521,15 +1592,29 @@ def scratch_mailbox():
 
 @pytest.fixture
 def inbox_messages():
-    """Up to two real INBOX message ids plus the mailbox token they live in."""
+    """The 2 marker mails in the scratch account's INBOX (D-04) — never real mail.
+    Selection is by MARKER_SUBJECT only, scoped to `_scratch_account`'s pick, so
+    the same-account move tests agree with `scratch_mailbox` on which account
+    they operate on. Each test taking this fixture must leave the marker mails
+    back in the INBOX; a run that does not makes the NEXT run fail loudly (D-04,
+    intended) — this fixture never falls back to another message and never
+    skips.
+    """
     m = _mail_adapter()
-    rows = [r for r in m.overview() if r["folder"].endswith("/INBOX") and r["total"]]
-    if not rows:
-        pytest.skip("no non-empty INBOX in Mail on this Mac")
-    folder = rows[0]["folder"]
-    hits = m.search(mailbox=folder, limit=2)["results"]
-    if not hits:
-        pytest.skip("no messages resolvable in the INBOX")
+    account = _scratch_account(m)
+    rows = m.overview()
+    inbox_rows = [
+        r for r in rows if r["account_id"] == account and r["folder"].endswith("/INBOX")
+    ]
+    if not inbox_rows:
+        pytest.fail(f"no INBOX for account {account} — check Mail is set up")
+    folder = inbox_rows[0]["folder"]
+    hits = m.search(subject=MARKER_SUBJECT, mailbox=folder, limit=2)["results"]
+    if len(hits) < 2:
+        pytest.fail(
+            f"found {len(hits)} of 2 marker mails (subject={MARKER_SUBJECT!r}) "
+            f"in {folder} — seed them once: {SEED_MARKERS}"
+        )
     return folder, [h["id"] for h in hits]
 
 

@@ -1,3 +1,4 @@
+import re
 import sqlite3
 
 import pytest
@@ -480,14 +481,19 @@ def _fingerprint_index(path, *, message_id_header=True, subjects_table=True):
         CREATE TABLE messages(
             ROWID INTEGER PRIMARY KEY, subject INT, sender INT, global_message_id INT,
             mailbox INT, date_received INT, date_sent INT, read INT, flagged INT,
-            deleted INT, conversation_id INT);
+            deleted INT, conversation_id INT, size INT, message_id INT,
+            subject_prefix TEXT);
         {subjects}
         CREATE TABLE addresses(ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
         CREATE TABLE mailboxes(ROWID INTEGER PRIMARY KEY, url TEXT);
         CREATE TABLE message_global_data(
             ROWID INTEGER PRIMARY KEY, message_id INTEGER{header_col});
-        CREATE TABLE recipients(ROWID INTEGER PRIMARY KEY, message INT, address INT);
+        CREATE TABLE recipients(
+            ROWID INTEGER PRIMARY KEY, message INT, address INT,
+            type INT, position INT);
         CREATE TABLE attachments(ROWID INTEGER PRIMARY KEY, message INT, name TEXT);
+        CREATE TABLE message_references(
+            ROWID INTEGER PRIMARY KEY, message INT, reference INT);
         """
     )
     c.commit()
@@ -646,7 +652,8 @@ def test_sidecar_mode_serves_the_native_fingerprint_and_queries(tmp_path, monkey
         INSERT INTO subjects VALUES (1, 'Invoice 42');
         INSERT INTO mailboxes VALUES (1, 'imap://A/INBOX');
         INSERT INTO message_global_data (ROWID) VALUES (100);
-        INSERT INTO messages VALUES (10,1,NULL,100,1,1700000000,1700000000,0,0,0,7);
+        INSERT INTO messages
+            VALUES (10,1,NULL,100,1,1700000000,1700000000,0,0,0,7,0,0,NULL);
         """
     )
     conn.commit()
@@ -671,3 +678,218 @@ def test_floor_message_names_mail_index_ids(tmp_path, monkeypatch):
     monkeypatch.setattr(mail_ids, "sidecar_path", lambda: tmp_path / "absent.sqlite")
     with pytest.raises(SchemaDrift, match="mail_index_ids"):
         mail_index._read_index(db, lambda conn: None)
+
+
+# --- HEADER_FINGERPRINT coverage (GATE-08) --------------------------------------------
+# The fingerprint must cover every column a query_* executor actually reads, so a real
+# store missing one surfaces as typed SchemaDrift, never a mis-parsed Pointer. Parsed
+# from the GENERATED SQL text (not the Python source): every FROM/JOIN binds an alias
+# to a table, every alias.column reference is resolved through that binding, and a
+# table the binding can't resolve to a HEADER_FINGERPRINT key (a CTE name like `sent`,
+# or a subquery) is skipped BY RULE — never by a hardcoded skip-list.
+
+_SQL_KEYWORDS = {
+    "on",
+    "where",
+    "order",
+    "group",
+    "limit",
+    "having",
+    "and",
+    "or",
+    "left",
+    "inner",
+    "join",
+    "select",
+    "as",
+    "by",
+    "with",
+    "union",
+    "not",
+    "null",
+    "exists",
+    "case",
+    "when",
+    "then",
+    "else",
+    "end",
+}
+
+_ALIAS_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s+([A-Za-z_][A-Za-z0-9_]*))?"
+)
+_COLUMN_REF_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _alias_table_map(sql: str) -> dict[str, str]:
+    """{alias: table} for every FROM/JOIN in one query's SQL text. An aliasless
+    ``FROM sent`` (a CTE reference) maps ``sent`` to itself, which is exactly what
+    makes it resolve to "not a HEADER_FINGERPRINT table" downstream."""
+    out: dict[str, str] = {}
+    for table, alias in _ALIAS_RE.findall(sql):
+        if not alias or alias.lower() in _SQL_KEYWORDS:
+            alias = table
+        out[alias] = table
+    return out
+
+
+def _alias_column_refs(sql: str) -> set[tuple[str, str]]:
+    """{(alias, column)} for every ``alias.column`` reference in the SQL text."""
+    return set(_COLUMN_REF_RE.findall(sql))
+
+
+def _every_build_query_sql() -> dict[str, str]:
+    """One representative call per ``build_*_query`` in mail_index — the coverage
+    test's whole input set. Arguments are dummy but representative enough to reach
+    every branch that shows up in the final SQL text (e.g. no optional filter is
+    omitted from the base queries; the base queries don't gate their column list on
+    filter presence)."""
+    return {
+        "build_header_query": mail_index.build_header_query(subject="x", limit=5)[0],
+        "build_thread_query": mail_index.build_thread_query("<a@b>", limit=5)[0],
+        "build_message_location_query": mail_index.build_message_location_query(
+            ["<a@b>"]
+        )[0],
+        "build_duplicate_summary_query": mail_index.build_duplicate_summary_query()[0],
+        "build_duplicate_offenders_query": (
+            mail_index.build_duplicate_offenders_query(5)[0]
+        ),
+        "build_duplicate_rows_query": mail_index.build_duplicate_rows_query(
+            "imap://A/INBOX"
+        )[0],
+        "build_cross_account_summary_query": (
+            mail_index.build_cross_account_summary_query()[0]
+        ),
+        "build_cross_account_rows_query": (
+            mail_index.build_cross_account_rows_query()[0]
+        ),
+        "build_trash_query": mail_index.build_trash_query("ACCT")[0],
+        "build_sent_triage_query": mail_index.build_sent_triage_query(5)[0],
+        "build_sent_recipients_query": mail_index.build_sent_recipients_query([1, 2])[
+            0
+        ],
+        "build_local_account_query": mail_index.build_local_account_query()[0],
+        "build_stats_query": mail_index.build_stats_query(0)[0],
+        "build_overview_query": mail_index.build_overview_query()[0],
+    }
+
+
+def test_header_fingerprint_covers_every_column_an_executor_reads():
+    for name, sql in _every_build_query_sql().items():
+        alias_table = _alias_table_map(sql)
+        for alias, column in _alias_column_refs(sql):
+            table = alias_table.get(alias)
+            if table is None or table not in mail_index.HEADER_FINGERPRINT:
+                continue  # a CTE/subquery alias — not a fingerprinted table, by rule
+            assert column in mail_index.HEADER_FINGERPRINT[table], (
+                f"{name}: {table}.{column} (via alias {alias!r}) is read but is "
+                "not in HEADER_FINGERPRINT — a real store missing it would "
+                "mis-parse instead of raising SchemaDrift"
+            )
+
+
+def test_fingerprint_coverage_parse_is_not_vacuous():
+    # Sanity on the parser itself: an empty/broken parse would make the coverage
+    # test above pass vacuously (no refs found == nothing to fail on).
+    found: set[tuple[str, str]] = set()
+    for sql in _every_build_query_sql().values():
+        alias_table = _alias_table_map(sql)
+        for alias, column in _alias_column_refs(sql):
+            table = alias_table.get(alias)
+            if table:
+                found.add((table, column))
+    assert ("messages", "size") in found
+    assert ("message_references", "reference") in found
+
+
+def test_duplicate_rows_executor_reads_the_fixture(fake_envelope):
+    # The tracer proof for query_duplicate_rows (GATE-08, mirrors
+    # test_sent_triage_executor_reads_the_fixture in test_mail_triage.py):
+    # seed_base's own <dup@ex.com> pair (ROWIDs 13, 14, both in ACCT_B/Travel) is
+    # exactly the byte-identity gate's shape a real store produces — same
+    # Message-ID, same mailbox, real size/date_sent columns — served correctly,
+    # in the SAME row order, in BOTH store shapes (fake_envelope depends on
+    # envelope_mode).
+    from tests.envelope import ACCT_B
+
+    rows = mail_index.query_duplicate_rows(f"imap://{ACCT_B}/Travel")
+    assert [r["rowid"] for r in rows] == [13, 14]
+    assert {r["message_id"] for r in rows} == {"<dup@ex.com>"}
+    assert all(r["size"] == 0 for r in rows)
+    assert all(r["date_sent"] == 1700001000 for r in rows)
+
+
+def test_every_executor_is_empty_on_a_rowless_store(
+    tmp_path, monkeypatch, envelope_mode
+):
+    # A schema-only store (tests.envelope.SCHEMA, no rows at all) in BOTH shapes —
+    # GATE-08's empty edge. Every query_* answers its empty value, never SchemaDrift:
+    # an empty store is a real, valid state (a fresh Mail install), not drift.
+    from tests.envelope import SCHEMA
+
+    db = tmp_path / "Envelope Index"
+    conn = sqlite3.connect(db)
+    conn.executescript(SCHEMA)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(mail_index, "envelope_index_path", lambda: db)
+
+    assert mail_index.query_search(subject="x") == []
+    assert mail_index.query_mailbox_urls() == []
+    assert mail_index.query_thread("<a@b>", limit=5) == []
+    assert mail_index.query_overview_rows() == []
+    assert mail_index.query_message_locations(["<a@b>"]) == []
+    assert mail_index.query_sent_triage(5) == []
+    assert mail_index.query_stats_rows(0) == []
+    assert mail_index.query_duplicate_summary() == []
+    assert mail_index.query_duplicate_offenders(5) == []
+    assert mail_index.query_duplicate_rows("imap://A/INBOX") == []
+    assert mail_index.query_cross_account_summary() == []
+    assert mail_index.query_cross_account_rows() == []
+    assert mail_index.query_trash_url("ACCT") is None
+    assert mail_index.query_local_account_url() is None
+
+
+def test_sequoiaify_is_idempotent_and_keeps_message_id(tmp_path):
+    # GATE-08's idempotency edge, and the sequoiaify_envelope fix this card makes:
+    # message_global_data.message_id (build_sent_triage_query's join key) must
+    # survive the reshape — the earlier version copied ROWID only, silently
+    # NULLing every row's message_id out.
+    from tests.conftest import sequoiaify_envelope
+    from tests.envelope import Envelope, seed_base
+
+    db = tmp_path / "Envelope Index"
+    seed_base(db)
+    env = Envelope(db)
+    env.execute("UPDATE message_global_data SET message_id = 999 WHERE ROWID = 1")
+    side = tmp_path / "mail_ids.sqlite"
+
+    sequoiaify_envelope(db, side)
+    conn = sqlite3.connect(db)
+    row = conn.execute(
+        "SELECT message_id FROM message_global_data WHERE ROWID = 1"
+    ).fetchone()
+    conn.close()
+    assert row == (999,), "message_id must survive the reshape, not null out"
+
+    conn = sqlite3.connect(db)
+    schema_before = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'message_global_data'"
+    ).fetchone()
+    rows_before = conn.execute(
+        "SELECT ROWID, message_id FROM message_global_data ORDER BY ROWID"
+    ).fetchall()
+    conn.close()
+
+    sequoiaify_envelope(db, side)  # a store already reshaped is left alone
+
+    conn = sqlite3.connect(db)
+    schema_after = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'message_global_data'"
+    ).fetchone()
+    rows_after = conn.execute(
+        "SELECT ROWID, message_id FROM message_global_data ORDER BY ROWID"
+    ).fetchall()
+    conn.close()
+    assert schema_after == schema_before
+    assert rows_after == rows_before
